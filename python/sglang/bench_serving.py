@@ -1185,6 +1185,8 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    warmup_prompt = input_requests[-1]
+    input_requests = input_requests[:-1]
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -1240,7 +1242,7 @@ async def benchmark(
         )
     else:
         # For all other datasets, input_requests is a list of DatasetRow objects
-        test_request = input_requests[0]
+        test_request = warmup_prompt
 
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
@@ -1845,7 +1847,9 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
+    args.gsp_prompts_per_group += 1
     input_requests = get_dataset(args, tokenizer, model_id)
+    args.gsp_prompts_per_group -= 1
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
