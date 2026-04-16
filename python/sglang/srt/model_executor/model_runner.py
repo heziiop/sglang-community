@@ -711,6 +711,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             use_npu_zero_buffer = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
             capture_dalay_enable = (self.server_args.disaggregation_mode in ["decode", "null"] and
                                     (use_npu_zero_buffer and self.spec_algorithm.is_eagle() and not disable_cuda_graph_bk))
+            capture_dalay_enable = False
             if capture_dalay_enable:
                 # we will delay main model graph capture until MTP weights already loaded
                 self.server_args.disable_cuda_graph = True
