@@ -1028,7 +1028,7 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def __init__(self, **kwargs):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_fuseep():
             self._inners = [
                 DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]

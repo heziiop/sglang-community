@@ -476,14 +476,21 @@ class NpuFuseEPMoE(DeepEPMoE):
         alt_stream=None,
         disable_sbo=False,
     ):
-        return self.dispatcher.dispatch(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-            gmm1_permuted_weight=self.w13_weight,
-            gmm1_permuted_weight_scale=self.w13_weight_scale,
-            gmm2_weight=self.w2_weight,
-            gmm2_weight_scale=self.w2_weight_scale,
-        ).hidden_state
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+        from sglang.srt.layers.moe.utils import DeepEPMode
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
+            return super().forward(hidden_states, topk_output)
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
+            return self.fuseep_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                gmm1_permuted_weight=self.w13_weight,
+                gmm1_permuted_weight_scale=self.w13_weight_scale_fuseep,
+                gmm2_weight=self.w2_weight,
+                gmm2_weight_scale=self.w2_weight_scale_fuseep,
+            ).hidden_state
 
     def permute_w13_weight_scale(self, w: torch.Tensor, tile_n: int):
         if tile_n % 2 != 0:
@@ -560,10 +567,10 @@ class NpuFuseEPMoE(DeepEPMoE):
                 w2_scale.to(torch.float32), requires_grad=False
             )
 
-            layer.w13_weight_scale = self.scale_from_float_to_int64(
+            layer.w13_weight_scale_fuseep = self.scale_from_float_to_int64(
                 layer.w13_weight_scale.data
             )
-            layer.w2_weight_scale = self.scale_from_float_to_int64(
+            layer.w2_weight_scale_fuseep = self.scale_from_float_to_int64(
                 layer.w2_weight_scale.data
             )
         else:
