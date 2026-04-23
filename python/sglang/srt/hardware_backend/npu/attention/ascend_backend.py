@@ -938,33 +938,56 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_out
 
             if self.use_fia:
-                """FIA will support multi-bs in the later version of CANN"""
-                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
+                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                    layer.layer_id
+                ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                query = q.reshape(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                ).contiguous()
+                num_token_padding = query.shape[0]
+                query = query[: forward_batch.num_token_non_padded_cpu]
+                actual_seq_lengths = (
+                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
-                q_len_offset = 0
-                for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
-                            q[None, q_len_offset : q_len_offset + q_len],
-                            k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
-                    q_len_offset += q_len
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    atten_mask=self.fia_mask,
+                    scale=layer.scaling,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    sparse_mode=3,
+                )
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
+                if forward_batch.num_token_non_padded_cpu != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding
+                                - forward_batch.num_token_non_padded_cpu,
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
 
             else:
                 causal = True
