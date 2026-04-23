@@ -68,7 +68,6 @@ from sglang.srt.utils import (
     is_hip,
     round_up,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
@@ -86,7 +85,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mooncake()
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
-        or a2a_backend.is_ascend_fuseep()
     ):
         return MaybeTboDeepEPDispatcher(
             group=(
@@ -104,7 +102,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
-    elif False:
+    elif a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
 
         return NpuFuseEPDispatcher(
@@ -292,17 +290,6 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
-        if envs.SGLANG_NPU_DEEPEP_USE_FUSED_MOE_DECODE.get():
-            from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
-            self.fuseep_dispatcher = NpuFuseEPDispatcher(
-                group=get_tp_group().device_group,
-                router_topk=self.moe_runner_config.top_k,
-                permute_fusion=True,
-                num_experts=self.moe_runner_config.num_experts,
-                num_local_experts=self.moe_runner_config.num_local_experts,
-                hidden_size=self.moe_runner_config.hidden_size,
-                params_dtype=self.moe_runner_config.params_dtype,
-            )
 
         self.should_fuse_routed_scaling_factor_in_topk = (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
