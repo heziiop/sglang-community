@@ -185,7 +185,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -787,6 +787,24 @@ class Scheduler(
                 "Radix cache is disabled for multimodal models with the "
                 "Transformers backend to avoid multimodal prefix-cache mismatches."
             )
+
+        # Decode radix cache is unsupported with hybrid SWA/SSM models —
+        # these use specialized memory pools incompatible with the
+        # prefix-match-and-lock allocation path.
+        if (
+            server_args.disaggregation_decode_enable_radix_cache
+            and server_args.disaggregation_mode == "decode"
+        ):
+            if self.is_hybrid_swa:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with sliding window attention (SWA) models"
+                )
+            if self.is_hybrid_ssm:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with Mamba/SSM models"
+                )
 
         effective_chunked_prefill_size = server_args.chunked_prefill_size
         if self.model_config.is_multimodal and uses_transformers_backend:
@@ -1421,13 +1439,17 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         import os
-        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+
+        enable_profiling: bool = (
+            os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        )
         prof_bs: int = int(os.getenv("PROFILING_BS", 8))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
         prof_step: int = int(os.getenv("PROFILING_step", 10))
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
+
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
                 profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
@@ -1443,13 +1465,16 @@ class Scheduler(
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     profiling_path
                 ),
-                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=10, repeat=1, skip_first=1),
+                schedule=torch_npu.profiler.schedule(
+                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                ),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=False,
                 with_flops=False,
                 with_modules=False,
-                experimental_config=experimental_config)
+                experimental_config=experimental_config,
+            )
 
         while True:
             # Receive requests
@@ -1472,8 +1497,11 @@ class Scheduler(
             if batch:
                 if enable_profiling:
                     is_prof_stage = False
-                    if (profiling_stage == "decode" and batch.forward_mode.is_decode()) or (
-                        profiling_stage == "prefill" and batch.forward_mode.is_extend()):
+                    if (
+                        profiling_stage == "decode" and batch.forward_mode.is_decode()
+                    ) or (
+                        profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                    ):
                         is_prof_stage = True
 
                     if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
@@ -1488,7 +1516,12 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
-                if enable_profiling and prof_cnt > 0 and prof_cnt < prof_step and is_prof_stage:
+                if (
+                    enable_profiling
+                    and prof_cnt > 0
+                    and prof_cnt < prof_step
+                    and is_prof_stage
+                ):
                     prof.step()
             else:
                 batch_result = None
@@ -2307,7 +2340,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        self.tree_cache.cache_unfinished_req(req, chunked=True)
+        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
