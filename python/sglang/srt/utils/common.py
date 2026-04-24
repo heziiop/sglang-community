@@ -570,6 +570,7 @@ def get_available_gpu_memory(
             torch.npu.empty_cache()
         if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
             import zbal
+
             if not zbal.is_mix_alloc():
                 free_gpu_memory, total_gpu_memory = zbal.zbal_module.mem_get_info()
             else:
@@ -1031,7 +1032,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.7.post2")
+        min_version: Minimum version required (e.g., "0.6.7.post3")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2954,6 +2955,15 @@ class LazyValue:
     def __init__(self, creator: Callable):
         self._creator = creator
         self._value = None
+
+    def __getattr__(self, name):
+        return getattr(self.value, name)
+
+    def __getitem__(self, key):
+        return self.value[key]
+
+    def __setitem__(self, key, value):
+        self.value[key] = value
 
     @property
     def value(self):

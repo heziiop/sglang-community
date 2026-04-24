@@ -664,6 +664,7 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
+    enforce_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
@@ -705,6 +706,7 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    disaggregation_enable_decode_radix_cache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -2193,19 +2195,6 @@ class ServerArgs:
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
-        # FlashInfer GDN decode is incompatible with no_buffer scheduling.
-        # See https://github.com/sgl-project/sglang/issues/20791
-        if (
-            self.linear_attn_decode_backend == "flashinfer"
-            and self.mamba_scheduler_strategy == "no_buffer"
-        ):
-            raise ValueError(
-                "FlashInfer GDN decode (--linear-attn-decode-backend flashinfer) is not "
-                "compatible with --mamba-scheduler-strategy no_buffer. "
-                "Please use --mamba-scheduler-strategy extra_buffer instead. "
-                "See https://github.com/sgl-project/sglang/issues/20791"
-            )
-
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
@@ -2215,7 +2204,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda(), is_npu()
+                is_cuda(),
+                is_npu(),
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
@@ -2632,9 +2622,27 @@ class ServerArgs:
                 )
 
     def _handle_linear_attn_backend(self):
-        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         import torch
 
+        # SM100+: default to FlashInfer GDN decode when the user hasn't
+        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
+        # (required by FlashInfer GDN on SM100+).
+        # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
+        # Excluded when MTP speculative decoding is enabled because
+        # FlashInfer GDN MTP verify is not yet supported on SM100+.
+        if (
+            self.linear_attn_decode_backend is None
+            and is_sm100_supported()
+            and self.mamba_ssm_dtype == "bfloat16"
+            and self.speculative_algorithm is None
+        ):
+            self.linear_attn_decode_backend = "flashinfer"
+            logger.info(
+                "SM100+ detected with mamba-ssm-dtype=bfloat16, "
+                "defaulting --linear-attn-decode-backend to flashinfer."
+            )
+
+        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"
@@ -3438,8 +3446,21 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.disaggregation_enable_decode_radix_cache:
+                if not self.disable_radix_cache:
+                    logger.info(
+                        "[EXPERIMENTAL] Decode server using RadixCache for incremental "
+                        "KV transfer. Prefix matching on the decode side enables transferring "
+                        "only the incremental KV delta from prefill."
+                    )
+                else:
+                    logger.warning(
+                        "--disaggregation-enable-decode-radix-cache is set but "
+                        "radix cache is disabled. Incremental transfer will not work."
+                    )
+            else:
+                self.disable_radix_cache = True
+                logger.info("Decode server using ChunkCache (radix cache disabled).")
 
         elif self.disaggregation_mode == "prefill":
             assert (
@@ -5834,6 +5855,12 @@ class ServerArgs:
             help="Disable shared experts fusion optimization for deepseek v3/r1.",
         )
         parser.add_argument(
+            "--enforce-shared-experts-fusion",
+            action="store_true",
+            help="Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). "
+            "Mutually exclusive with --disable-shared-experts-fusion.",
+        )
+        parser.add_argument(
             "--disable-chunked-prefix-cache",
             action="store_true",
             help="Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
@@ -6012,6 +6039,11 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-decode-radix-cache",
+            action="store_true",
+            help="Enable radix cache prefix matching on decode side for incremental KV transfer in PD disaggregation.",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

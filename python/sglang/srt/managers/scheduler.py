@@ -1388,13 +1388,17 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         import os
-        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+
+        enable_profiling: bool = (
+            os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        )
         prof_bs: int = int(os.getenv("PROFILING_BS", 8))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
         prof_step: int = int(os.getenv("PROFILING_step", 10))
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
+
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
                 profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
@@ -1410,13 +1414,16 @@ class Scheduler(
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     profiling_path
                 ),
-                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=10, repeat=1, skip_first=1),
+                schedule=torch_npu.profiler.schedule(
+                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                ),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=False,
                 with_flops=False,
                 with_modules=False,
-                experimental_config=experimental_config)
+                experimental_config=experimental_config,
+            )
 
         while True:
             # Receive requests
@@ -1439,8 +1446,11 @@ class Scheduler(
             if batch:
                 if enable_profiling:
                     is_prof_stage = False
-                    if (profiling_stage == "decode" and batch.forward_mode.is_decode()) or (
-                        profiling_stage == "prefill" and batch.forward_mode.is_extend()):
+                    if (
+                        profiling_stage == "decode" and batch.forward_mode.is_decode()
+                    ) or (
+                        profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                    ):
                         is_prof_stage = True
 
                     if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
@@ -1455,7 +1465,12 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
-                if enable_profiling and prof_cnt > 0 and prof_cnt < prof_step and is_prof_stage:
+                if (
+                    enable_profiling
+                    and prof_cnt > 0
+                    and prof_cnt < prof_step
+                    and is_prof_stage
+                ):
                     prof.step()
             else:
                 batch_result = None
@@ -1852,6 +1867,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
+                positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
@@ -2177,6 +2193,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,
             routed_dp_rank=recv_req.routed_dp_rank,
             priority=recv_req.priority,
@@ -3312,6 +3329,14 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                # Protect tree-owned prefix pages from being freed.
+                if req.disagg_decode_prefix_len > 0:
+                    req.cache_protected_len = req.disagg_decode_prefix_len
+                # Ensure last_node is valid for dec_lock_ref inside
+                # cache_finished_req. When no prefix was matched in
+                # pop_preallocated, last_node was never set (stays None).
+                if req.last_node is None and hasattr(self.tree_cache, "root_node"):
+                    req.last_node = self.tree_cache.root_node
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3709,6 +3734,7 @@ def run_scheduler_process(
     if _is_npu:
         # init zbal if is set
         from sglang.srt.hardware_backend.npu.utils import init_zbal
+
         init_zbal(server_args.tp_size, gpu_id, tp_rank)
 
     dp_rank = configure_scheduler(

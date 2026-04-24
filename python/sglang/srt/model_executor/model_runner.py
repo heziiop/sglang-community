@@ -136,12 +136,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -709,8 +709,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.device == "npu":
             disable_cuda_graph_bk = self.server_args.disable_cuda_graph
             use_npu_zero_buffer = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
-            capture_dalay_enable = (self.server_args.disaggregation_mode in ["decode", "null"] and
-                                    (use_npu_zero_buffer and self.spec_algorithm.is_eagle() and not disable_cuda_graph_bk))
+            capture_dalay_enable = self.server_args.disaggregation_mode in [
+                "decode",
+                "null",
+            ] and (
+                use_npu_zero_buffer
+                and self.spec_algorithm.is_eagle()
+                and not disable_cuda_graph_bk
+            )
             capture_dalay_enable = False
             if capture_dalay_enable:
                 # we will delay main model graph capture until MTP weights already loaded
@@ -722,8 +728,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pass  # will lazy init zbal till MTP weights loaded
             elif use_npu_zero_buffer and not self.is_draft_worker:
                 from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
-                lazy_init_zbal_gva_mem(self.device, self.gpu_id, self.tp_rank, self.tp_size,
-                                       get_world_group().cpu_group)
+
+                lazy_init_zbal_gva_mem(
+                    self.device,
+                    self.gpu_id,
+                    self.tp_rank,
+                    self.tp_size,
+                    get_world_group().cpu_group,
+                )
             self.init_device_graphs()
 
             if capture_dalay_enable:
@@ -1838,7 +1850,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _init_lora_cuda_graph_moe_buffers(self):
         """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
 
-        Must be called before init_memory_pool() so that profile_max_num_token()
+        Must be called before init_memory_pool() so that memory profiling
         sees the reduced available memory and sizes KV cache correctly.
         All MoE LoRA layers share one set of buffers (managed by the
         lora_backend) since they execute sequentially during forward.
@@ -2789,6 +2801,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+        if (
+            forward_batch.replace_embeds is not None
+            and forward_batch.replace_positions is not None
+        ):
+            # Token embedding overrides: get base embeddings, scatter replacements
+            if "input_embeds" not in kwargs:
+                embed_layer = self.model.get_input_embeddings()
+                kwargs["input_embeds"] = embed_layer(forward_batch.input_ids)
+            kwargs["input_embeds"][forward_batch.replace_positions] = (
+                forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
+            )
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
