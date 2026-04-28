@@ -1405,7 +1405,7 @@ class SchedulerDisaggregationDecodeMixin:
                     if len(batch.reqs) >= prof_bs and prof_cnt == 0:
                         prof.start()
                         prof_cnt += 1
-                    if prof_cnt > 0:
+                    elif prof_cnt > 0:
                         prof_cnt += 1
                     if prof_cnt == prof_step:
                         torch.npu.synchronize()
@@ -1483,7 +1483,7 @@ class SchedulerDisaggregationDecodeMixin:
                     if len(batch.reqs) >= prof_bs and prof_cnt == 0:
                         prof.start()
                         prof_cnt += 1
-                    if prof_cnt > 0:
+                    elif prof_cnt > 0:
                         prof_cnt += 1
                     if prof_cnt == prof_step:
                         torch.npu.synchronize()
