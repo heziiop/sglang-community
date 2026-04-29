@@ -75,6 +75,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-prefill-delayer`                          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--prefill-delayer-max-delay-passes`                | `30`     | Type: int                      |      A2, A3      |
 | `--prefill-delayer-token-usage-low-watermark`       | `None`   | Type: float                    |      A2, A3      |
+| `--prefill-delayer-decode-bs-low-watermark`         | `None`   | Type: int                      |      A2, A3      |
 | `--prefill-delayer-forward-passes-buckets`          | `None`   | List[float]                    |      A2, A3      |
 | `--prefill-delayer-wait-seconds-buckets`            | `None`   | List[float]                    |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |

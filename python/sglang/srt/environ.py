@@ -258,6 +258,7 @@ class Envs:
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
+    SGLANG_PREFILL_DELAYER_DECODE_BS_LOW_WATERMARK = EnvInt(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
@@ -608,6 +609,10 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_DECODE_BS_LOW_WATERMARK",
+    "Please use '--prefill-delayer-decode-bs-low-watermark' instead.",
 )
 
 # Import cuda_coredump to trigger auto-injection of CUDA env vars

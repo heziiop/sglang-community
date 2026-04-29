@@ -733,6 +733,7 @@ class PrefillAdder:
                 local_prefillable=True,
                 max_prefill_bs=self.max_prefill_bs,
                 new_prefill_requests_count=self.new_prefill_requests_count,
+                decode_bs=self.running_batch.batch_size() if self.running_batch is not None else 0,
             )
         ):
             return AddReqResult.OTHER

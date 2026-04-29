@@ -43,23 +43,26 @@ class PrefillDelayer:
         server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
+        decode_bs_low_watermark: Optional[int] = None,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
+        self._decode_bs_low_watermark = decode_bs_low_watermark
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
-            f"token_usage_low_watermark={self._token_usage_low_watermark}"
+            f"token_usage_low_watermark={self._token_usage_low_watermark} "
+            f"decode_bs_low_watermark={self._decode_bs_low_watermark}"
         )
-        # The global_info contains four pieces of information:
-        # prefillable, token_watermark_force_allow, running_batch, and max_prefill_bs.
+        # The global_info contains five pieces of information:
+        # prefillable, token_watermark_force_allow, new_prefill_requests_count, max_prefill_bs, and decode_bs.
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 4),
+            (dp_size_dim, attn_tp_size, 5),
             dtype=torch.int64,
             device=device,
         )
@@ -117,6 +120,7 @@ class PrefillDelayer:
         global_token_watermark_force_allow = tp0_info[:, 1]
         num_new_prefill_requests = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
+        global_decode_bs = tp0_info[:, 4]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -142,6 +146,18 @@ class PrefillDelayer:
                     next_state=None,
                     output_allow=True,
                     output_reason="wait_success" if exist_previous_wait else "no_wait",
+                    **debug_info,
+                )
+
+            if (
+                (w := self._decode_bs_low_watermark) is not None
+                and global_decode_bs.max().item() < w
+            ):
+                exist_previous_wait = prev_state is not None
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="decode_bs_watermark",
                     **debug_info,
                 )
 
@@ -217,6 +233,7 @@ class PrefillDelayer:
                 int(local_token_watermark_force_allow),
                 kwargs.get("new_prefill_requests_count", 0),
                 kwargs.get("max_prefill_bs", 0),
+                kwargs.get("decode_bs", 0),
             ],
             device="cpu",
             dtype=torch.int64,
@@ -279,12 +296,19 @@ def _record_single_pass_result(
                 f"num_token_watermark_force_allow={output.num_token_watermark_force_allow}, "
                 f"actual_execution={actual_execution})"
             )
+        elif output.output_allow and (output.output_reason == "decode_bs_watermark"):
+            logger.info(
+                f"PrefillDelayer force allow prefill due to low decode batch size. "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"actual_execution={actual_execution})"
+            )
         else:
             assert output.output_reason in {
                 "",
                 "wait_success",
                 "no_wait",
                 "delay",
+                "decode_bs_watermark",
             }
 
     if metrics_collector is not None:

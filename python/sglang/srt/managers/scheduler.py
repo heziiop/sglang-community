@@ -958,6 +958,7 @@ class Scheduler(
                 ),
                 max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
+                decode_bs_low_watermark=self.server_args.prefill_delayer_decode_bs_low_watermark,
                 device=(
                     self.tp_group.device
                     if self.server_args.disable_overlap_schedule

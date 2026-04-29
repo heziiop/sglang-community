@@ -365,6 +365,7 @@ class ServerArgs:
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
+    prefill_delayer_decode_bs_low_watermark: Optional[int] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
 
@@ -971,6 +972,8 @@ class ServerArgs:
             self.prefill_delayer_max_delay_passes = x
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
+        if x := envs.SGLANG_PREFILL_DELAYER_DECODE_BS_LOW_WATERMARK.get():
+            self.prefill_delayer_decode_bs_low_watermark = x
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -4274,6 +4277,12 @@ class ServerArgs:
             type=float,
             default=None,
             help="Token usage low watermark for prefill delayer.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-decode-bs-low-watermark",
+            type=int,
+            default=None,
+            help="Decode batch size low watermark for prefill delayer. When all DP ranks are prefillable and decode batch size is below this value, force allow prefill.",
         )
         parser.add_argument(
             "--prefill-delayer-forward-passes-buckets",

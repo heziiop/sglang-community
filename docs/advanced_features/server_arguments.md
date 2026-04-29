@@ -144,6 +144,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |
+| `--prefill-delayer-decode-bs-low-watermark` | Decode batch size low watermark for prefill delayer. When all DP ranks are prefillable and decode batch size is below this value, force allow prefill. | `None` | Type: int |
 | `--prefill-delayer-forward-passes-buckets` | Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added. | `None` | List[float] |
 | `--prefill-delayer-wait-seconds-buckets` | Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added. | `None` | List[float] |
 
