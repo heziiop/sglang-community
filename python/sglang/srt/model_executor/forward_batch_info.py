@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -847,14 +848,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
+        attn_cp_size = get_attention_cp_size()
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            align_size = attn_tp_size
+            if (
+                self.forward_mode.is_context_parallel_extend()
+                and attn_cp_size > 1
+                and get_moe_a2a_backend().is_deepep()
+            ):
+                align_size = attn_cp_size * attn_tp_size
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], align_size)
 
         # make sure that each rank has the same number of tokens to do collective communication.
-        attn_cp_size = get_attention_cp_size()
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
 
@@ -880,8 +888,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
+        local_dp_buffer_len = num_tokens
+        if (
+            self.forward_mode.is_context_parallel_extend()
+            and attn_cp_size > 1
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            local_dp_buffer_len = num_tokens // attn_cp_size
         set_dp_buffer_len(
-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+            buffer_len,
+            local_dp_buffer_len,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
