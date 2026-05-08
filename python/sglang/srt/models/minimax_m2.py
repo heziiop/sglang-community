@@ -1211,19 +1211,20 @@ class MiniMaxM2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if len(aux_hidden_states) > 0:
+                aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        x,
+                        self.attn_cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    for x in aux_hidden_states
+                ]
 
         if len(aux_hidden_states) == 0:
             return hidden_states
-        else:
-            aux_hidden_states = [
-                cp_all_gather_rerange_output(
-                    x,
-                    self.attn_cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                for x in aux_hidden_states
-            ]
+
         return hidden_states, aux_hidden_states
 
 
