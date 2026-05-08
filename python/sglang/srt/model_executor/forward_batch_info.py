@@ -1024,9 +1024,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accepted_tokens = self._pad_tensor_to_size(
                     spec_info.num_accepted_tokens, bs
                 )
-            spec_info.hidden_states = self._pad_tensor_to_size(
-                spec_info.hidden_states, num_tokens
-            )
+            if not (
+                self.forward_mode.is_context_parallel_extend()
+                and get_attention_cp_size() > 1
+            ):
+                spec_info.hidden_states = self._pad_tensor_to_size(
+                    spec_info.hidden_states, num_tokens
+                )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
