@@ -133,7 +133,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+        if (
+            server_args.enable_dp_attention or server_args.attn_cp_size > 1
+        ) and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
