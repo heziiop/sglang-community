@@ -909,7 +909,7 @@ class SchedulerPPMixin:
                 self.pp_rank * self.tp_size + dp_offset,
             )
         else:
-            data = None
+            data = []
 
         if self.attn_tp_size > 1:
             data = broadcast_pyobj(
