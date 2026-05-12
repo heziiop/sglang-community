@@ -1100,7 +1100,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
-            if logits_output.hidden_states is not None:
+            if not (
+                self.forward_mode.is_context_parallel_extend()
+                and get_attention_cp_size() > 1
+                and logits_output.hidden_states is not None
+            ):
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
 
     @property
