@@ -26,11 +26,23 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_pp_group,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -50,6 +62,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
             2 * self.hidden_size,
@@ -84,6 +97,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
+
+        if self.norm_before_residual:
+            residual = hidden_states
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
@@ -145,6 +161,8 @@ class LlamaModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -180,6 +198,15 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            # hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            embeds = cp_split_and_rebuild_data(forward_batch, embeds)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+
         residual = None
         hidden_states, residual = self.midlayer(
             positions,
@@ -192,6 +219,24 @@ class LlamaModel(nn.Module):
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
+
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            hidden_states_to_logits = cp_all_gather_rerange_output(
+                hidden_states_to_logits,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            hidden_states_to_aux = cp_all_gather_rerange_output(
+                hidden_states_to_aux,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -239,6 +284,49 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
+        self.attn_cp_rank = get_attn_context_model_parallel_rank()
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
+            forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                len(input_ids),
+                self.attn_cp_rank,
+                self.attn_cp_size,
+                forward_batch.seq_lens_cpu.tolist(),
+            )
+
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())

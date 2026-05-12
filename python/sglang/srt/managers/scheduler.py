@@ -1712,8 +1712,8 @@ class Scheduler(
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
-                work_reqs = None
-                control_reqs = None
+                work_reqs = []
+                control_reqs = []
 
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
