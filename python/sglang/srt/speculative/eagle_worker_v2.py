@@ -175,7 +175,9 @@ class EagleDraftWorker(BaseDraftWorker):
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context
+            if (server_args.enable_dp_attention or server_args.attn_cp_size > 1)
+            else empty_context
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
