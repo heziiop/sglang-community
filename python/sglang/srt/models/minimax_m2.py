@@ -1101,7 +1101,7 @@ class MiniMaxM2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled() or self.attn_cp_size > 1,
         )
 
         def layer_fn(idx, prefix: str) -> nn.Module:
