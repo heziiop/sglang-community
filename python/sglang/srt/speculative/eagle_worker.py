@@ -208,7 +208,9 @@ class EAGLEWorker(TpModelWorker):
             backup_disable_cuda_graph
         )
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context
+            if (server_args.enable_dp_attention or server_args.attn_cp_size > 1)
+            else empty_context
         )
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
