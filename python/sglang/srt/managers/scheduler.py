@@ -1520,9 +1520,12 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
+            check_size_is_same(len(recv_reqs))
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
