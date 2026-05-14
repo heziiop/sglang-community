@@ -147,10 +147,13 @@ def unpatch_all_all_gathers():
 def check_size_is_same(size_shape):
     from sglang.srt.distributed.parallel_state import get_tp_group
 
+    rank = torch.distributed.get_rank(get_tp_group().cpu_group)
     cpu_group = get_tp_group().cpu_group
     world_size = dist.get_world_size(cpu_group)
     assert world_size == 8
     tensor = torch.tensor(size_shape, device="cpu")
     torch.distributed.all_reduce(tensor, group=cpu_group)
     out_value = tensor.item()
-    assert out_value == size_shape * world_size
+    if out_value != size_shape * world_size:
+        print(f"Rank {rank} has size_shape {size_shape}")
+        assert False
