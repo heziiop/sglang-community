@@ -1,6 +1,7 @@
 import inspect
 import os
 
+import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 
@@ -141,3 +142,15 @@ def unpatch_all_all_gathers():
     _ORIGINAL_FUNCTIONS.clear()
     _PRINTED_CALL_SITES.clear()
     print("[Unpatch Success] Restored all original all_gather functions.")
+
+
+def check_size_is_same(size_shape):
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    cpu_group = get_tp_group().cpu_group
+    world_size = dist.get_world_size(cpu_group)
+    assert world_size == 8
+    tensor = torch.tensor(size_shape, device="cpu")
+    out = torch.distributed.all_reduce(tensor, group=cpu_group)
+    out_value = out.item()
+    assert out_value == size_shape * world_size

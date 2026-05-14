@@ -1303,6 +1303,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if is_prefill_context_parallel_enabled():
+            from sglang.srt.speculative.hook_allgather import check_size_is_same
+
+            check_size_is_same(input_ids.shape[0])
             if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
