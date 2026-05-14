@@ -25,15 +25,15 @@ def patch_all_all_gathers():
         world_size = dist.get_world_size(current_group)
 
         this_file = os.path.abspath(__file__)
-        caller_info = None
-        for frame_info in inspect.stack():
+        stack = inspect.stack()
+        caller_frames = []
+        for frame_info in stack:
             if os.path.abspath(frame_info.filename) != this_file:
-                caller_info = frame_info
-                break
+                caller_frames.append(frame_info)
+                if len(caller_frames) >= 4:
+                    break
 
-        call_site_key = None
-        if caller_info:
-            call_site_key = (caller_info.filename, caller_info.lineno)
+        call_site_key = tuple((f.filename, f.lineno) for f in caller_frames)
 
         if call_site_key and call_site_key in _PRINTED_CALL_SITES:
             return
@@ -44,15 +44,13 @@ def patch_all_all_gathers():
         msg = (
             f"[Capture Log] {api_name} -> Device: {device_id}, World Size: {world_size}"
         )
-        if caller_info:
-            caller_file = caller_info.filename
-            caller_line = caller_info.lineno
+        for i, frame_info in enumerate(caller_frames):
+            caller_file = frame_info.filename
+            caller_line = frame_info.lineno
             caller_code = (
-                caller_info.code_context[0].strip()
-                if caller_info.code_context
-                else "N/A"
+                frame_info.code_context[0].strip() if frame_info.code_context else "N/A"
             )
-            msg += f"\n  Caller: {caller_file}:{caller_line} -> {caller_code}"
+            msg += f"\n  L{i}: {caller_file}:{caller_line} -> {caller_code}"
 
         print(msg)
 
