@@ -2520,6 +2520,9 @@ class Scheduler(
             new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
+        check_size_is_same(need_mlp_sync)
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -2532,9 +2535,11 @@ class Scheduler(
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
+        check_size_is_same(new_batch is not None)
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            check_size_is_same(ret.input_ids.shape[0])
         else:
             # Run decode (skip for prefill-only batches)
             if (
