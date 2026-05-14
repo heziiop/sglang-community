@@ -151,6 +151,6 @@ def check_size_is_same(size_shape):
     world_size = dist.get_world_size(cpu_group)
     assert world_size == 8
     tensor = torch.tensor(size_shape, device="cpu")
-    out = torch.distributed.all_reduce(tensor, group=cpu_group)
-    out_value = out.item()
+    torch.distributed.all_reduce(tensor, group=cpu_group)
+    out_value = tensor.item()
     assert out_value == size_shape * world_size
