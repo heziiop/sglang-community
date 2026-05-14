@@ -562,6 +562,11 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
+
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
+        check_size_is_same(batch.input_ids.shape[0])
+
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
