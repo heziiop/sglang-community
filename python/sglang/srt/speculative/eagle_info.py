@@ -333,6 +333,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 topk=self.topk,
             )
 
+            # Sync greedy verify results across TP ranks: different GPUs may
+            # produce slightly different logits due to floating-point
+            # non-determinism, causing different argmax results.
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_accepted_drafts, src=0)
+
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
