@@ -147,6 +147,7 @@ def unpatch_all_all_gathers():
 def check_size_is_same(size_shape):
     from sglang.srt.distributed.parallel_state import get_tp_group
 
+    size_shape = int(size_shape)
     rank = torch.distributed.get_rank(get_tp_group().cpu_group)
     cpu_group = get_tp_group().cpu_group
     world_size = dist.get_world_size(cpu_group)
