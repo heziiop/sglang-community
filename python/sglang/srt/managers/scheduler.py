@@ -1533,6 +1533,10 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                from sglang.srt.speculative.hook_allgather import check_size_is_same
+
+                if batch.forward_mode.is_context_parallel_extend():
+                    check_size_is_same(batch.input_ids.shape[0])
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -2950,6 +2954,11 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
+        if batch.forward_mode.is_context_parallel_extend():
+            check_size_is_same(batch.input_ids.shape[0])
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
