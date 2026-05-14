@@ -224,7 +224,15 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
+
+            from sglang.srt.speculative.hook_allgather import (
+                patch_all_all_gathers,
+                unpatch_all_all_gathers,
+            )
+
+            patch_all_all_gathers()
             self.init_cuda_graphs()
+            unpatch_all_all_gathers()
             if self.adaptive_controller is not None:
                 self.adaptive_controller.register(
                     SpecRuntimeState(
