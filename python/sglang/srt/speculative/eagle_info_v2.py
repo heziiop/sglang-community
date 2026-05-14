@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_attn_cp_group, get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
@@ -405,6 +405,11 @@ class EagleVerifyInputV2Mixin:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_accepted_drafts, src=0)
+            attn_cp_group = get_attn_cp_group()
+            if is_dp_attention_enabled() and attn_cp_group.world_size > 1:
+                attn_cp_group.broadcast(predict, src=0)
+                attn_cp_group.broadcast(accept_index, src=0)
+                attn_cp_group.broadcast(num_accepted_drafts, src=0)
         else:
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -467,6 +472,11 @@ class EagleVerifyInputV2Mixin:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_accepted_drafts, src=0)
+            attn_cp_group = get_attn_cp_group()
+            if is_dp_attention_enabled() and attn_cp_group.world_size > 1:
+                attn_cp_group.broadcast(predict, src=0)
+                attn_cp_group.broadcast(accept_index, src=0)
+                attn_cp_group.broadcast(num_accepted_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation

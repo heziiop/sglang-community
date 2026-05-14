@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_attn_cp_group, get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
@@ -345,6 +345,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_accepted_drafts, src=0)
+            attn_cp_group = get_attn_cp_group()
+            if is_dp_attention_enabled() and attn_cp_group.world_size > 1:
+                attn_cp_group.broadcast(predict, src=0)
+                attn_cp_group.broadcast(accept_index, src=0)
+                attn_cp_group.broadcast(num_accepted_drafts, src=0)
 
         else:
             # apply temperature and get target probs
@@ -413,6 +418,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_accepted_drafts, src=0)
+            attn_cp_group = get_attn_cp_group()
+            if is_dp_attention_enabled() and attn_cp_group.world_size > 1:
+                attn_cp_group.broadcast(predict, src=0)
+                attn_cp_group.broadcast(accept_index, src=0)
+                attn_cp_group.broadcast(num_accepted_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
