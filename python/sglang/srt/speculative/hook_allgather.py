@@ -1,8 +1,11 @@
+import inspect
+import os
+
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 
-# 全局字典，用于存储原始函数的引用，方便还原
 _ORIGINAL_FUNCTIONS = {}
+_PRINTED_CALL_SITES = set()
 
 
 def patch_all_all_gathers():
@@ -15,12 +18,43 @@ def patch_all_all_gathers():
         return
 
     def log_meta(api_name, input_tensor, group):
+        global _PRINTED_CALL_SITES
+
         device_id = input_tensor.device.index if input_tensor.is_cuda else "CPU"
         current_group = group if group is not None else dist.group.WORLD
         world_size = dist.get_world_size(current_group)
-        print(
+
+        this_file = os.path.abspath(__file__)
+        caller_info = None
+        for frame_info in inspect.stack():
+            if os.path.abspath(frame_info.filename) != this_file:
+                caller_info = frame_info
+                break
+
+        call_site_key = None
+        if caller_info:
+            call_site_key = (caller_info.filename, caller_info.lineno)
+
+        if call_site_key and call_site_key in _PRINTED_CALL_SITES:
+            return
+
+        if call_site_key:
+            _PRINTED_CALL_SITES.add(call_site_key)
+
+        msg = (
             f"[Capture Log] {api_name} -> Device: {device_id}, World Size: {world_size}"
         )
+        if caller_info:
+            caller_file = caller_info.filename
+            caller_line = caller_info.lineno
+            caller_code = (
+                caller_info.code_context[0].strip()
+                if caller_info.code_context
+                else "N/A"
+            )
+            msg += f"\n  Caller: {caller_file}:{caller_line} -> {caller_code}"
+
+        print(msg)
 
     # 1. 拦截 dist.all_gather
     _ORIGINAL_FUNCTIONS["dist.all_gather"] = dist.all_gather
@@ -82,6 +116,7 @@ def patch_all_all_gathers():
 def unpatch_all_all_gathers():
     """还原所有被拦截的 all_gather 变体至原本状态"""
     global _ORIGINAL_FUNCTIONS
+    global _PRINTED_CALL_SITES
 
     if not _ORIGINAL_FUNCTIONS:
         print("[Warning] No patches found to restore.")
@@ -105,6 +140,6 @@ def unpatch_all_all_gathers():
             "dist_nn_f.all_gather_into_tensor"
         ]
 
-    # 清空全局字典，释放引用
     _ORIGINAL_FUNCTIONS.clear()
+    _PRINTED_CALL_SITES.clear()
     print("[Unpatch Success] Restored all original all_gather functions.")
