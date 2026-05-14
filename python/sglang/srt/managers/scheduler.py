@@ -3019,6 +3019,10 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                from sglang.srt.speculative.hook_allgather import check_size_is_same
+
+                if worker_batch_or_batch.forward_mode.is_context_parallel_extend():
+                    check_size_is_same(worker_batch_or_batch.input_ids.shape[0])
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
