@@ -1527,6 +1527,8 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             check_size_is_same(len(recv_reqs))
             self.process_input_requests(recv_reqs)
+            check_size_is_same(len(self.waiting_queue))
+            check_size_is_same(self.running_batch.batch_size())
             if self._engine_paused:
                 continue
 
@@ -1536,8 +1538,6 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                from sglang.srt.speculative.hook_allgather import check_size_is_same
-
                 if batch.forward_mode.is_context_parallel_extend():
                     check_size_is_same(batch.input_ids.shape[0])
                 result = self.run_batch(batch)
@@ -1554,6 +1554,8 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1566,7 +1568,10 @@ class Scheduler(
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
+            check_size_is_same(len(recv_reqs))
             self.process_input_requests(recv_reqs)
+            check_size_is_same(len(self.waiting_queue))
+            check_size_is_same(self.running_batch.batch_size())
             if self._engine_paused:
                 continue
 
@@ -1831,8 +1836,11 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        num_health_check_skipped = 0
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1841,6 +1849,7 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                num_health_check_skipped += 1
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -1850,6 +1859,10 @@ class Scheduler(
                 else:
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
+
+        check_size_is_same(num_health_check_skipped)
+        check_size_is_same(len(self.waiting_queue))
+        check_size_is_same(self.running_batch.batch_size())
 
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
@@ -2444,10 +2457,17 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        from sglang.srt.speculative.hook_allgather import check_size_is_same
+
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+
+        check_size_is_same(len(self.waiting_queue))
+        check_size_is_same(self.running_batch.batch_size())
+        check_size_is_same(self.chunked_req is not None)
+        check_size_is_same(self.running_batch.batch_is_full)
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -2517,15 +2537,19 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        check_size_is_same(self.running_batch.batch_size())
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
-        from sglang.srt.speculative.hook_allgather import check_size_is_same
 
         check_size_is_same(need_mlp_sync)
+        check_size_is_same(new_batch is not None)
+        if new_batch is not None:
+            check_size_is_same(new_batch.input_ids.shape[0])
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -2545,6 +2569,8 @@ class Scheduler(
             check_size_is_same(ret.input_ids.shape[0])
         else:
             # Run decode (skip for prefill-only batches)
+            check_size_is_same(self.running_batch.is_empty())
+            check_size_is_same(self.running_batch.batch_size())
             if (
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
@@ -2561,6 +2587,7 @@ class Scheduler(
         ret = self._maybe_prepare_ngram_embedding(ret)
 
         if ret:
+            check_size_is_same(ret.input_ids.shape[0])
             set_schedule_time_batch(ret)
 
         return ret
