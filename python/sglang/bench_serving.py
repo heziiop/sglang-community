@@ -2075,6 +2075,13 @@ if __name__ == "__main__":
         help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
     )
     parser.add_argument(
+        "--longbench-v2-input-len",
+        type=int,
+        default=None,
+        help="Target input length in tokens for the LongBench-v2 dataset. "
+        "If set, prompts longer than this will be truncated, and shorter prompts will be repeated to fill.",
+    )
+    parser.add_argument(
         "--random-input-len",
         type=int,
         default=1024,

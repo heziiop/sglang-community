@@ -29,6 +29,7 @@ class LongBenchV2Dataset(BaseDataset):
     num_requests: int
     fixed_output_len: Optional[int]
     context_len: Optional[int]
+    input_len: Optional[int]
 
     @classmethod
     def from_args(cls, args: Namespace) -> "LongBenchV2Dataset":
@@ -37,6 +38,7 @@ class LongBenchV2Dataset(BaseDataset):
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
+            input_len=getattr(args, "longbench_v2_input_len", None),
         )
 
     def load(
@@ -48,7 +50,21 @@ class LongBenchV2Dataset(BaseDataset):
             tokenizer=tokenizer,
             fixed_output_len=self.fixed_output_len,
             context_len=self.context_len,
+            input_len=self.input_len,
         )
+
+
+def _adjust_prompt_to_target_len(
+    prompt_ids: List[int],
+    target_len: int,
+    tokenizer: PreTrainedTokenizerBase,
+) -> str:
+    if len(prompt_ids) > target_len:
+        prompt_ids = prompt_ids[:target_len]
+    elif len(prompt_ids) < target_len:
+        repeats = (target_len + len(prompt_ids) - 1) // len(prompt_ids)
+        prompt_ids = (prompt_ids * repeats)[:target_len]
+    return tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
 
 def sample_longbench_v2_requests(
@@ -57,6 +73,7 @@ def sample_longbench_v2_requests(
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
     context_len: Optional[int] = None,
+    input_len: Optional[int] = None,
 ) -> List[DatasetRow]:
     output_len = (
         fixed_output_len
@@ -93,6 +110,10 @@ def sample_longbench_v2_requests(
         prompt = _format_prompt(example)
         prompt_ids = tokenizer(prompt).input_ids
         prompt_len = len(prompt_ids)
+
+        if input_len is not None:
+            prompt = _adjust_prompt_to_target_len(prompt_ids, input_len, tokenizer)
+            prompt_len = input_len
 
         if context_len is not None and prompt_len + output_len > context_len:
             continue
