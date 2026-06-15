@@ -4,12 +4,16 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.utils import is_npu
+
 from .common.index import topk_index_reduce
 from .common.utils import get_cu_seqblocks
 from .decode.flash_with_topk_idx import flash_decode_with_topk_idx
 from .decode.topk_sparse import flash_decode_with_gqa_share_sparse
 from .prefill.flash_with_topk_idx import flash_prefill_with_topk_index
 from .prefill.topk_sparse import flash_prefill_with_gqa_share_sparse
+
+_is_npu = is_npu()
 
 
 def minimax_sparse_prefill(
@@ -53,6 +57,41 @@ def minimax_sparse_prefill(
     ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
     ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
     """
+    if _is_npu:
+        from .npu.prefill_sparse import minimax_npu_sparse_prefill
+
+        return minimax_npu_sparse_prefill(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            sink=sink,
+            idx_q=idx_q,
+            idx_k_cache=idx_k_cache,
+            idx_v_cache=idx_v_cache,
+            idx_sink=idx_sink,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=sm_scale,
+            idx_sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            use_msa=use_msa,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            seqlens_cpu=seqlens_cpu,
+        )
+
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
@@ -165,6 +204,50 @@ def minimax_sparse_decode(
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if _is_npu:
+        from .npu.flash_block_score_decode import flash_decode_bnsd_with_topk_idx
+        from .npu.topk_sparse_decode import flash_decode_bnsd_with_gqa_share_sparse
+
+        num_idx_heads = idx_q.shape[1]
+        num_kv_heads = k_cache.shape[1]
+        idx_group_size = num_idx_heads // num_kv_heads
+
+        idx_o, topk_idx = flash_decode_bnsd_with_topk_idx(
+            q=idx_q,
+            sink=idx_sink,
+            k_cache_bnsd=idx_k_cache,
+            v_cache_bnsd=idx_v_cache if not disable_index_value else None,
+            block_table=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            block_size=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+        )
+
+        if idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
+
+        o = flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=sink,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=v_cache,
+            block_table=req_to_token,
+            seq_lens=seq_lens,
+            block_size=block_size_k,
+            topk_idx=topk_idx,
+            sm_scale=sm_scale,
+        )
+
+        return idx_o, o
+
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
     # transform) instead of block ids, plus the per-query effective KV length.
