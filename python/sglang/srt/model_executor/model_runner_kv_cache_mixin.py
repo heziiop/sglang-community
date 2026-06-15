@@ -655,7 +655,17 @@ class ModelRunnerKVCacheMixin:
                 disable_value_sparse_layer_ids = (
                     get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
                 )
-                self.token_to_kv_pool = MiniMaxSparseKVPool(
+                from sglang.srt.utils import is_npu
+
+                if is_npu():
+                    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                        NPUMiniMaxSparseKVPool,
+                    )
+
+                    KVPoolClass = NPUMiniMaxSparseKVPool
+                else:
+                    KVPoolClass = MiniMaxSparseKVPool
+                self.token_to_kv_pool = KVPoolClass(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
