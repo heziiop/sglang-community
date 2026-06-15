@@ -1,10 +1,12 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
     unwrap_write_loc,
@@ -548,3 +550,231 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         ik_layer.device, non_blocking=True
                     )
         torch.npu.synchronize()
+
+
+class NPUHATokenToKOnlyPool(MHATokenToKOnlyPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super(MHATokenToKOnlyPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    head_num,
+                    head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+        self._finalize_allocation_log(size)
+
+    def _get_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._get_key_buffer(layer_id)
+
+    def get_kv_size_bytes(self):
+        k_size_bytes = get_tensor_size_bytes(self.k_buffer)
+        return k_size_bytes, 0
+
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.k_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+
+class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        idx_head_dim: int,
+        dense_layer_ids: List[int],
+        sparse_layer_ids: List[int],
+        device: str,
+        disable_value_sparse_layer_ids: Optional[List[int]] = None,
+        enable_memory_saver: bool = False,
+        index_dtype: Optional[torch.dtype] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.size = size
+        self.page_size = page_size
+        self.dtype = dtype
+        self.device = device
+
+        local_dense_layer_ids = [
+            lid for lid in dense_layer_ids if start_layer <= lid < end_layer
+        ]
+        local_sparse_layer_ids = [
+            lid for lid in sparse_layer_ids if start_layer <= lid < end_layer
+        ]
+
+        index_dtype = index_dtype if index_dtype is not None else dtype
+
+        disable_set = set(disable_value_sparse_layer_ids or [])
+        local_kv_sparse_layer_ids = [
+            g for g in local_sparse_layer_ids if g not in disable_set
+        ]
+        local_k_only_sparse_layer_ids = [
+            g for g in local_sparse_layer_ids if g in disable_set
+        ]
+
+        self.sparse_layer_id_mapping: dict[int, int] = {
+            gid: i for i, gid in enumerate(local_sparse_layer_ids)
+        }
+        self.index_kv_layer_id_mapping: dict[int, int] = {
+            gid: i for i, gid in enumerate(local_kv_sparse_layer_ids)
+        }
+        self.index_k_layer_id_mapping: dict[int, int] = {
+            gid: i for i, gid in enumerate(local_k_only_sparse_layer_ids)
+        }
+
+        self.main_pool = NPUMHATokenToKVPool(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=len(local_dense_layer_ids) + len(local_sparse_layer_ids),
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        self.index_kv_pool: Optional[NPUMHATokenToKVPool] = (
+            NPUMHATokenToKVPool(
+                size=size,
+                page_size=page_size,
+                dtype=index_dtype,
+                head_num=1,
+                head_dim=idx_head_dim,
+                layer_num=len(local_kv_sparse_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+            )
+            if local_kv_sparse_layer_ids
+            else None
+        )
+
+        self.index_k_pool: Optional[NPUHATokenToKOnlyPool] = (
+            NPUHATokenToKOnlyPool(
+                size=size,
+                page_size=page_size,
+                dtype=index_dtype,
+                head_num=1,
+                head_dim=idx_head_dim,
+                layer_num=len(local_k_only_sparse_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+            )
+            if local_k_only_sparse_layer_ids
+            else None
+        )
+
+        self.mem_usage = self.main_pool.mem_usage
+        if self.index_kv_pool is not None:
+            self.mem_usage += self.index_kv_pool.mem_usage
+        if self.index_k_pool is not None:
+            self.mem_usage += self.index_k_pool.mem_usage
+
+        self.layer_num = self.main_pool.layer_num
+        self.start_layer = self.main_pool.start_layer
+        self.end_layer = self.main_pool.end_layer
+        self.head_num = self.main_pool.head_num
+        self.head_dim = self.main_pool.head_dim
+        self.layer_transfer_counter = None
+
+    def set_fused_kv_index_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+        cache_idx_v: Optional[torch.Tensor],
+    ) -> None:
+        disable_value = cache_idx_v is None
+        self.set_kv_buffer(layer, loc, cache_k, cache_v)
+        if disable_value:
+            self.set_index_k_buffer(layer, loc, cache_idx_k)
+        else:
+            self.set_index_kv_buffer(layer, loc, cache_idx_k, cache_idx_v)
+
+    def set_index_k_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+    ) -> None:
+        mapped_id = self.index_k_layer_id_mapping.get(layer.layer_id)
+        if mapped_id is not None:
+            sub_pool = self.index_k_pool
+            if cache_idx_k.dtype != sub_pool.dtype:
+                cache_idx_k = cache_idx_k.to(sub_pool.dtype)
+            if sub_pool.store_dtype != sub_pool.dtype:
+                cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
+            torch_npu.npu_scatter_nd_update_(
+                sub_pool.k_buffer[mapped_id].view(-1, 1, sub_pool.head_dim),
+                loc.view(-1, 1),
+                cache_idx_k.view(-1, 1, sub_pool.head_dim),
+            )
+            return
+        mapped_id = self.index_kv_layer_id_mapping.get(layer.layer_id)
+        if mapped_id is not None:
+            self.index_kv_pool.set_kv_buffer(
+                layer,
+                loc,
+                cache_idx_k,
+                cache_idx_k,
+                layer_id_override=mapped_id,
+            )
+            return
+        raise ValueError(
+            f"layer.layer_id={layer.layer_id} is not a sparse attention layer; "
+            f"sparse layers: {list(self.sparse_layer_id_mapping.keys())}"
+        )
+
+    def get_index_k_state_buf_infos(self):
+        pool = self.index_k_pool
+        n = pool.layer_num
+        data_ptrs = [pool.k_buffer[i].data_ptr() for i in range(n)]
+        data_lens = [pool.k_buffer[i].nbytes for i in range(n)]
+        item_lens = [pool.k_buffer[i][0].nbytes * pool.page_size for i in range(n)]
+        return data_ptrs, data_lens, item_lens
