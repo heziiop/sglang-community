@@ -255,15 +255,30 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     from sglang.srt.configs.model_config import is_minimax_sparse
 
     if is_minimax_sparse(runner.model_config.hf_config):
-        from sglang.srt.layers.attention.minimax_sparse_backend import (
-            MiniMaxHybridAttnBackend,
-            MiniMaxSparseAttnBackend,
-        )
+        from sglang.srt.utils import is_npu
 
-        sparse_backend = MiniMaxSparseAttnBackend(runner)
-        return MiniMaxHybridAttnBackend(
-            full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
-        )
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.attention.ascend_minimax_sparse_backend import (
+                AscendMiniMaxSparseAttnBackend,
+            )
+            from sglang.srt.layers.attention.minimax_sparse_backend import (
+                MiniMaxHybridAttnBackend,
+            )
+
+            sparse_backend = AscendMiniMaxSparseAttnBackend(runner)
+            return MiniMaxHybridAttnBackend(
+                full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
+            )
+        else:
+            from sglang.srt.layers.attention.minimax_sparse_backend import (
+                MiniMaxHybridAttnBackend,
+                MiniMaxSparseAttnBackend,
+            )
+
+            sparse_backend = MiniMaxSparseAttnBackend(runner)
+            return MiniMaxHybridAttnBackend(
+                full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
+            )
 
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
