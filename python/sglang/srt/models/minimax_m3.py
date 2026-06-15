@@ -1627,6 +1627,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     that omits ``sparse_attention_config`` will produce a pure-dense model.
     """
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "experts": ["experts.0.w1", "experts.0.w2", "experts.0.w3"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1638,6 +1644,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+
+        if quant_config is not None and hasattr(
+            quant_config, "update_packed_modules_mapping"
+        ):
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
 
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
