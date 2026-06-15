@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_hip,
+    is_npu,
     log_info_on_rank0,
     make_layers,
 )
@@ -98,6 +99,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _device_sm = get_device_sm()
 
 # fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
@@ -730,9 +732,9 @@ class MiniMaxM3Attention(nn.Module):
         # Fused GemmaRMSNorm + partial NeoX RoPE (minimax_qknorm_rope) is a CUDA
         # JIT kernel, valid only for the exact verified config: per-head gemma
         # norm, head_dim=128, rotary_dim=64 (so rotary_dim/2 == warpSize), NeoX
-        # style, no output gate. Everything else (incl. ROCm) falls back to the
-        # _qk_norm_rope path. The fp32 cos_sin_cache requirement is re-checked at
-        # call time.
+        # style, no output gate. Everything else (incl. ROCm and NPU) falls back
+        # to the _qk_norm_rope path. The fp32 cos_sin_cache requirement is
+        # re-checked at call time.
         self._use_fused_qknorm_rope = (
             _is_cuda
             and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE.get()
