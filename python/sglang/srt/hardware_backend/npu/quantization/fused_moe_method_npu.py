@@ -102,6 +102,12 @@ def npu_fused_experts_w4a4(
     return final_hidden_states
 
 
+def _swiglu_oai_decomposed(hidden_states, gemm1_alpha, gemm1_limit):
+    from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+
+    return swiglu_oai(hidden_states, gemm1_alpha, gemm1_limit)
+
+
 def npu_fused_experts(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -116,6 +122,9 @@ def npu_fused_experts(
     w13_offset = kwargs.get("w13_offset", None)
     w2_offset = kwargs.get("w2_offset", None)
     use_wna16 = kwargs.get("use_wna16", False)
+    use_swiglu_oai = kwargs.get("use_swiglu_oai", False)
+    gemm1_alpha = kwargs.get("gemm1_alpha", 0.0)
+    gemm1_limit = kwargs.get("gemm1_limit", 0.0)
 
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
@@ -165,18 +174,36 @@ def npu_fused_experts(
     )[0]
     # act_fn: swiglu
     if not use_wna16:
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            hidden_states,
-            activate_left=True,
-            quant_mode=1,
-        )
+        if use_swiglu_oai:
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dequantize(
+                hidden_states,
+                scale=w13_scale.to(scale_dtype),
+                activate_left=True,
+            )
+            hidden_states = _swiglu_oai_decomposed(
+                hidden_states, gemm1_alpha, gemm1_limit
+            )
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(
+                hidden_states
+            )
+        else:
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+                hidden_states,
+                activate_left=True,
+                quant_mode=1,
+            )
 
         scale_args2 = {
             "scale": [w2_scale.to(scale_dtype)],
             "per_token_scale": [pertoken_scale],
         }
     else:
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        if use_swiglu_oai:
+            hidden_states = _swiglu_oai_decomposed(
+                hidden_states, gemm1_alpha, gemm1_limit
+            )
+        else:
+            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
@@ -215,6 +242,10 @@ def npu_fused_experts_w8a8_decode(
     top_k: int,
     **kwargs,
 ):
+    use_swiglu_oai = kwargs.get("use_swiglu_oai", False)
+    gemm1_alpha = kwargs.get("gemm1_alpha", 0.0)
+    gemm1_limit = kwargs.get("gemm1_limit", 0.0)
+
     num_tokens = hidden_states.shape[:-1].numel()
     first_expert_idx = 0
     last_expert_idx = w13.shape[0]
@@ -248,9 +279,18 @@ def npu_fused_experts_w8a8_decode(
     )[0]
 
     # act_fn: swiglu
-    hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-        hidden_states, quant_mode=1, activate_left=True
-    )
+    if use_swiglu_oai:
+        hidden_states = torch.ops.npu.npu_dequantize(
+            hidden_states,
+            scale=w13_scale,
+            activate_left=True,
+        )
+        hidden_states = _swiglu_oai_decomposed(hidden_states, gemm1_alpha, gemm1_limit)
+        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+    else:
+        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            hidden_states, quant_mode=1, activate_left=True
+        )
 
     output = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -677,6 +717,16 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(hidden_states.dtype)
 
+        use_swiglu_oai = False
+        gemm1_alpha = 0.0
+        gemm1_limit = 0.0
+        if hasattr(layer, "moe_runner_config"):
+            cfg = layer.moe_runner_config
+            if cfg.gemm1_alpha is not None and cfg.gemm1_alpha > 0:
+                use_swiglu_oai = True
+                gemm1_alpha = cfg.gemm1_alpha
+                gemm1_limit = cfg.gemm1_clamp_limit or 0.0
+
         # prefill
         if not torch.npu.is_current_stream_capturing():
             output = npu_fused_experts(
@@ -688,6 +738,9 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 top_k=topk_ids.shape[1],
+                use_swiglu_oai=use_swiglu_oai,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_limit=gemm1_limit,
             )
         # decode
         else:
@@ -700,6 +753,9 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 top_k=topk_ids.shape[1],
+                use_swiglu_oai=use_swiglu_oai,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_limit=gemm1_limit,
             )
 
         return StandardCombineInput(hidden_states=output)
@@ -725,17 +781,41 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         # act_fn: swiglu
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            x=hidden_states,
-            weight_scale=layer.w13_weight_scale,
-            activation_scale=hidden_states_scale,
-            bias=None,
-            quant_scale=None,
-            quant_offset=None,
-            group_index=group_list,
-            activate_left=True,
-            quant_mode=1,
-        )
+        use_swiglu_oai = False
+        gemm1_alpha = 0.0
+        gemm1_limit = 0.0
+        if hasattr(layer, "moe_runner_config"):
+            cfg = layer.moe_runner_config
+            if cfg.gemm1_alpha is not None and cfg.gemm1_alpha > 0:
+                use_swiglu_oai = True
+                gemm1_alpha = cfg.gemm1_alpha
+                gemm1_limit = cfg.gemm1_clamp_limit or 0.0
+
+        if use_swiglu_oai:
+            hidden_states = torch.ops.npu.npu_dequantize(
+                hidden_states,
+                scale=layer.w13_weight_scale,
+                activation_scale=hidden_states_scale,
+                activate_left=True,
+            )
+            hidden_states = _swiglu_oai_decomposed(
+                hidden_states, gemm1_alpha, gemm1_limit
+            )
+            hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(
+                hidden_states
+            )
+        else:
+            hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+                x=hidden_states,
+                weight_scale=layer.w13_weight_scale,
+                activation_scale=hidden_states_scale,
+                bias=None,
+                quant_scale=None,
+                quant_offset=None,
+                group_index=group_list,
+                activate_left=True,
+                quant_mode=1,
+            )
 
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
