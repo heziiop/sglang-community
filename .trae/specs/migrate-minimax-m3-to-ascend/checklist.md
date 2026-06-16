@@ -1,0 +1,18 @@
+- [ ] `minimax_m3.py` 中添加 `_is_npu` 变量，所有 CUDA-only 功能在 NPU 上正确禁用或走 fallback
+- [ ] vllm-ascend 的 Triton 稀疏注意力 kernel 已适配到 SGLang 框架（`flash_block_score_decode.py` + `topk_sparse_decode.py`）
+- [ ] Triton kernel 遵循 Ascend 适配要点：不使用 `tl.make_block_ptr`、`CHUNK_SIZE_T >= 2`、streaming topk、-1 sentinel
+- [ ] `NPUMiniMaxSparseKVPool` 实现完成，使用 `NPUMHATokenToKVPool` 作为子池，index KV 缓存读写正确
+- [ ] KV cache 格式正确：K cache 拼接 main K + index K（`head_size + index_head_dim`）
+- [ ] `AscendMiniMaxSparseAttnBackend` 实现 index head topk 选择 + main head sparse attention 两步流程
+- [ ] `attention_registry.py` 在 NPU 平台上为 MiniMax-M3 正确创建 `AscendMiniMaxSparseAttnBackend`
+- [ ] `model_runner_kv_cache_mixin.py` 在 NPU 上创建 `NPUMiniMaxSparseKVPool`
+- [ ] ModelSlim W8A8 量化权重 (`Eco-Tech/MiniMax-M3-w8a8`) 能正确加载，Linear 和 MoE 层量化方案正确应用
+- [ ] MXFP8 checkpoint 在 NPU 上正确反量化为 BF16（参考 vllm-ascend 的处理方式）
+- [ ] SwiGLU-OAI 激活函数在 NPU W8A8 MoE 路径中正确计算（复用 vllm-ascend 的 `swiglu_oai_forward`）
+- [ ] MoE 量化路径中 SwiGLU-OAI 使用拆分路径：gmm → swigluoai → dynamic_quant
+- [ ] per-head RMSNorm + partial RoPE 在 NPU 上有正确实现或 fallback
+- [ ] MoE 路由 TopK 的 sigmoid + correction_bias 在 NPU 上正确工作
+- [ ] NPU Graph 模式下 MiniMax-M3 sparse decode 能正确捕获和回放
+- [ ] 端到端测试通过：MiniMax-M3 W8A8 在 NPU 上能完成推理，GSM8K 精度可接受
+- [ ] 共享专家融合在 NPU 上正确禁用，不影响推理结果
+- [ ] MSA (fmha_sm100) 在 NPU 上正确跳过，走 sparse attention fallback
