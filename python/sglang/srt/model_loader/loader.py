@@ -224,6 +224,7 @@ def _get_quantization_config(
                 },
                 "model": {
                     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
                     "gate_up_proj": ["gate_proj", "up_proj"],
                     "fused_qkv_a_proj_with_mqa": [
                         "q_a_proj",
