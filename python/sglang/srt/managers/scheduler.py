@@ -1533,7 +1533,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         import os
-        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.ps.tp_rank == 0
         prof_bs: int = int(os.getenv("PROFILING_BS", "8"))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
         prof_step: int = int(os.getenv("PROFILING_step", "10"))
@@ -1622,7 +1622,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         import os
-        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.ps.tp_rank == 0
         prof_bs: int = int(os.getenv("PROFILING_BS", "8"))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
         prof_step: int = int(os.getenv("PROFILING_step", "10"))
