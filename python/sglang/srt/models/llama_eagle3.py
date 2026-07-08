@@ -50,6 +50,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         prefix: str = "",
     ) -> None:
         super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
 
         # Input layer concats embeds + target_hidden before qkv (input dim 2x).
         self.is_input_layer = layer_id == 0
@@ -90,6 +91,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             # Input layer consumes target hidden states; no carried residual to fuse.
             residual = hidden_states
             hidden_states = self.hidden_norm(hidden_states)
+            if self.norm_before_residual:
+                residual = hidden_states
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         else:
