@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.dcp.comm import dcp_enabled, get_attention_dcp_rank, get_attention_dcp_world_size
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -455,6 +456,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k, cache_v = cache_k.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+
+        if dcp_enabled():
+            valid_mask = (
+                loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
+            )
+            if not valid_mask.all():
+                loc = loc[valid_mask]
+                cache_k = cache_k[valid_mask]
+                cache_v = cache_v[valid_mask]
+            loc = loc // get_attention_dcp_world_size()
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),

@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
 
 # ---------------------------------------------------------------------------
 # KV-index build (PR #25090, Triton/MHA): per-rank local KV indices.
@@ -276,6 +278,9 @@ def correct_attn_out(
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
     """
+    if is_npu():
+        return correct_attn_out_torch(out, lses, cp_rank, new_output)
+
     if ctx is None:
         ctx = CPTritonContext()
 
@@ -331,3 +336,265 @@ def correct_attn_out(
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
+
+
+# ---------------------------------------------------------------------------
+# PyTorch fallback implementations for platforms without Triton (e.g. NPU).
+# These replicate the Triton kernel logic using standard PyTorch operations.
+# ---------------------------------------------------------------------------
+
+
+def create_dcp_kv_indices_torch(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    dcp_kernel_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_start_idx: Optional[torch.Tensor],
+    kv_indices: Optional[torch.Tensor],
+    req_to_token_stride: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """
+    PyTorch fallback for ``create_triton_kv_indices_for_dcp_triton``.
+    先计算每个req本rank分到的position id，根据position id计算每个token在虚拟的全局kvcache中的逻辑id
+    逻辑id除以dcp_size，得到物理id，物理id即是本卡分到的kv在kvcache中的真实id
+
+    Builds per-rank KV token indices by walking each request's owned
+    positions (owner rule: ``pos % dcp_size == dcp_rank``), loading the
+    global token index from ``req_to_token``, and converting to the local
+    (sharded) format (``global_idx // dcp_size``).
+
+    Args:
+        req_to_token:    [max_batch, max_context_len] global token pool
+        req_pool_indices:[num_seqs] int64 pool indices of active requests
+        dcp_kernel_lens: [num_seqs] int32 per-rank visible KV length
+        kv_indptr:       [num_seqs+1] int64 cumsum of dcp_kernel_lens
+        kv_start_idx:    [num_seqs] int64 start offsets (or None → 0)
+        kv_indices:      output buffer (int64) or None → allocate
+        req_to_token_stride: stride of dim-0 in req_to_token
+        dcp_size:        DCP world size
+        dcp_rank:        current DCP rank
+
+    Returns:
+        kv_indices [sum(dcp_kernel_lens)] int64 tensor with local KV indices
+    """
+    num_seqs = req_pool_indices.shape[0]
+    total_len = int(dcp_kernel_lens.sum().item())
+
+    if kv_indices is None:
+        kv_indices = torch.empty(
+            total_len, dtype=torch.int64, device=req_to_token.device
+        )
+
+    for i in range(num_seqs):
+        pool_idx = req_pool_indices[i].item()
+        offset = kv_indptr[i].item()
+        local_len = dcp_kernel_lens[i].item()
+
+        if local_len == 0:
+            continue
+
+        kv_start = kv_start_idx[i].item() if kv_start_idx is not None else 0
+        kv_start_mod = kv_start % dcp_size
+        first = kv_start + ((dcp_rank + dcp_size - kv_start_mod) % dcp_size)
+
+        # Vectorized: all absolute positions for this request
+        abs_pos = first + torch.arange(
+            local_len, dtype=torch.int64, device=req_to_token.device
+        ) * dcp_size
+
+        # Fetch global token indices and convert to local (sharded) indices
+        global_indices = req_to_token[pool_idx, abs_pos]
+        kv_indices[offset : offset + local_len] = global_indices // dcp_size
+
+    return kv_indices
+
+
+def create_global_dcp_kv_indices_torch(
+    kv_indptr: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_cu_lens: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
+    extend_cu_prefix_lens: torch.Tensor,
+    kv_indices: torch.Tensor,
+    extend_prefix_lens_sum: int,
+    dcp_world_size: int,
+) -> None:
+    """
+    PyTorch fallback for ``create_dcp_kv_indices``.
+
+    Builds global KV indices that point into the ``dcp_kv_buffer``.
+    Layout of dcp_kv_buffer:
+      [rank0_r1.prefix, rank1_r1.prefix, ..., rankN_r1.prefix,
+       rank0_r2.prefix, ..., rankN_r2.prefix,
+       r1.extend, r2.extend, ..., rn.extend]
+    dcp_kv_buffer的布局:[请求1的完整prefix, 请求2的完整prefix, ..., 请求n的完整prefix,
+                         请求1的local extend, 请求2的local extend, ..., 请求n的local extend]
+    
+    dcp_kv_buffer可以视作kv cache
+    kv_indices表示每个请求的各token在dcp_kv_buffer中的id
+    kv_indices:[请求1的token1, 请求1的token2, ..., 请求1的tokenN,
+                请求2的token1, 请求2的token2, ..., 
+                ...,
+                请求n的token1, 请求n的token2, ..., 请求n的tokenN]  
+
+
+    The prefix section is all-gathered (all ranks interleaved), and
+    the extend section is per-rank local KV appended at the end.
+
+    Args:
+        kv_indptr:      [num_seqs+1] int32 cumsum of total (prefix+extend) lens
+        extend_seq_lens:[num_seqs] int32 extend token count per request
+        extend_cu_lens: [num_seqs] int32 starting offset of extend per request
+                        in the per-rank extend block
+        extend_prefix_lens: [num_seqs] int32 prefix token count per request
+        extend_cu_prefix_lens: [num_seqs] int32 cumsum offset of prefix per
+                               request in the all-gathered prefix block
+        kv_indices:     output [total_tokens] int32 tensor (pre-allocated)
+        extend_prefix_lens_sum: total number of prefix tokens across all requests
+        dcp_world_size: DCP world size (unused in index computation, kept for
+                        signature compatibility with Triton version)
+    """
+    num_seqs = extend_seq_lens.shape[0]
+    device = kv_indices.device
+
+    for i in range(num_seqs):
+        prefix_len = extend_prefix_lens[i].item()
+        prefix_start = extend_cu_prefix_lens[i].item()
+        extend_len = extend_seq_lens[i].item()
+        extend_start = extend_cu_lens[i].item()
+        kv_start = kv_indptr[i].item()
+
+        # Prefix section: indices point into the all-gathered prefix block
+        if prefix_len > 0:
+            kv_indices[kv_start : kv_start + prefix_len] = (
+                prefix_start + torch.arange(prefix_len, dtype=torch.int32, device=device)
+            )
+
+        # Extend section: indices point into the per-rank extend block
+        # (starts after all prefix tokens)
+        if extend_len > 0:
+            kv_indices[
+                kv_start + prefix_len : kv_start + prefix_len + extend_len
+            ] = (
+                extend_prefix_lens_sum
+                + extend_start
+                + torch.arange(extend_len, dtype=torch.int32, device=device)
+            )
+
+
+def update_kv_lens_and_indices_torch(
+    kv_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    local_kv_lens: torch.Tensor,
+    local_kv_lens_cumsum: torch.Tensor,
+    local_kv_indices: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> None:
+    """
+    PyTorch fallback for ``update_kv_lens_and_indices``.
+
+    Compacts the global KV indices down to per-rank local indices by
+    applying the owner rule: for each request, take every ``dcp_world_size``-th
+    element starting at offset ``dcp_rank`` from the global indices, and
+    divide by ``dcp_world_size`` to produce the local (sharded) index.
+
+    This is a decode-path kernel (called by ``plan_dcp_decode_metadata``).
+    对每个请求，从全局 kv_indices 中每隔 dcp_world_size 取一个属于本 rank 的元素，除以 dcp_world_size 得到本地索引
+
+    Args:
+        kv_lens:       [num_seqs] int32 original KV lengths (unused by torch impl;
+                       already consumed by ``update_local_kv_lens_for_dcp``)
+        kv_indptr:     [num_seqs+1] int32 cumsum of original KV lengths
+        kv_indices:    [total_orig_len] int32 global KV indices
+        local_kv_lens: [num_seqs] int32 per-rank KV lengths (pre-computed)
+        local_kv_lens_cumsum: [num_seqs+1] int32 cumsum of local_kv_lens
+        local_kv_indices: [total_local_len] int32 output buffer (pre-allocated)
+        dcp_rank:      current DCP rank
+        dcp_world_size:DCP world size
+    """
+    num_seqs = local_kv_lens.shape[0]
+
+    for i in range(num_seqs):
+        local_len = local_kv_lens[i].item()
+        if local_len == 0:
+            continue
+
+        global_start = kv_indptr[i].item() + dcp_rank
+        global_end = global_start + local_len * dcp_world_size
+        local_start = local_kv_lens_cumsum[i].item()
+
+        # Slice with step: take every dcp_world_size-th element
+        local_kv_indices[local_start : local_start + local_len] = (
+            kv_indices[global_start:global_end:dcp_world_size] // dcp_world_size
+        )
+
+
+def correct_attn_out_torch(
+    out: torch.Tensor,
+    lses: torch.Tensor,
+    cp_rank: int,
+    new_output: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch fallback for ``correct_attn_out`` / ``_correct_attn_cp_out_kernel``.
+
+    Merges partial attention outputs from different DCP ranks using the
+    log-sum-exp (LSE) correction:
+        global_lse  = logsumexp(lse_ranks, dim=0)
+        scale       = exp(local_lse - global_lse)
+        corrected   = attn_out * scale
+
+    The caller is responsible for the cross-rank reduction (all-reduce or
+    reduce-scatter) after this function returns.
+
+    Args:
+        out:         Attention output  [B, H, D]  (or [B, 1, H, D])
+        lses:        All-gathered LSE  [N, B, H]  (or with extra dims)
+        cp_rank:     Index of this rank's LSE in lses
+        new_output:  Pre-allocated output buffer [H, B, D] (or None → allocate)
+
+    Returns:
+        (corrected_out [H, B, D], global_lse [B, H])
+    """
+    # --- Normalize to 3D views (same as Triton path) ---
+    if out.ndim == 4 and out.shape[1] == 1:
+        out = out.squeeze(1)
+    assert out.ndim == 3, f"expected out [B,H,D], got {tuple(out.shape)}"
+
+    if lses.ndim == 4 and lses.shape[-1] == 1:
+        lses = lses.squeeze(-1)
+    if lses.ndim == 4 and lses.shape[1] == 1:
+        lses = lses.squeeze(1)
+    assert lses.ndim == 3, (
+        f"expected lses [N,B,H], got {tuple(lses.shape)}"
+    )
+
+    B, H, D = out.shape
+    N = lses.shape[0]
+
+    # Global LSE via logsumexp (natural log, equivalent to Triton's log2/exp2
+    # w.r.t. the final scale factor since exp(ln(x))/exp(ln(y)) = exp2(log2(x))/exp2(log2(y)))
+    global_lse = torch.logsumexp(lses, dim=0)  # [B, H]
+    local_lse = lses[cp_rank]  # [B, H]
+
+    scale = torch.nan_to_num(
+        torch.exp(local_lse - global_lse),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )  # [B, H]
+
+    # Apply correction: attn_out *= scale
+    corrected = out * scale.unsqueeze(-1)  # [B, H, D]
+
+    # Transpose to [H, B, D] layout expected by cp_lse_ag_out_rs_mla
+    if new_output is None:
+        new_output = corrected.transpose(0, 1).contiguous()  # [H, B, D]
+    else:
+        new_output.copy_(corrected.transpose(0, 1))
+
+    return new_output, global_lse

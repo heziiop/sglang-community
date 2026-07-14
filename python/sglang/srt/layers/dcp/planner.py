@@ -24,10 +24,13 @@ from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_si
 from sglang.srt.layers.dcp.comm import dcp_enabled
 from sglang.srt.layers.dcp.kernels import (
     create_dcp_kv_indices,
+    create_global_dcp_kv_indices_torch,
     update_kv_lens_and_indices,
+    update_kv_lens_and_indices_torch,
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.utils import is_npu
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -100,16 +103,29 @@ def prepare_decode_context_parallel_metadata(
     extend_cu_lens[1:] = torch.cumsum(extend_seq_lens, dim=0)
     extend_cu_lens = extend_cu_lens[:-1]
 
-    create_dcp_kv_indices[(len(seq_lens),)](
-        dcp_kv_indptr,
-        extend_seq_lens,
-        extend_cu_lens,
-        extend_prefix_lens,
-        extend_cu_prefix_lens,
-        dcp_kv_indices,
-        extend_prefix_lens_sum,
-        get_dcp_world_size(),
-    )
+    # PyTorch fallback for platforms without Triton (e.g. NPU)
+    if is_npu():
+        create_global_dcp_kv_indices_torch(
+            dcp_kv_indptr,
+            extend_seq_lens,
+            extend_cu_lens,
+            extend_prefix_lens,
+            extend_cu_prefix_lens,
+            dcp_kv_indices,
+            extend_prefix_lens_sum,
+            get_dcp_world_size(),
+        )
+    else:
+        create_dcp_kv_indices[(len(seq_lens),)](
+            dcp_kv_indptr,
+            extend_seq_lens,
+            extend_cu_lens,
+            extend_prefix_lens,
+            extend_cu_prefix_lens,
+            dcp_kv_indices,
+            extend_prefix_lens_sum,
+            get_dcp_world_size(),
+        )
     dcp_local_prefix_kv_indices = (
         dcp_prefix_kv_indices[
             dcp_prefix_kv_indices % get_dcp_world_size() == get_dcp_rank()
@@ -172,17 +188,29 @@ def plan_dcp_decode_metadata(
         (max_local_len + BLOCK_SIZE - 1) // BLOCK_SIZE if max_local_len > 0 else 1
     )
     grid = (bs, num_blocks)
-    update_kv_lens_and_indices[grid](
-        kv_lens,
-        kv_indptr,
-        kv_indices,
-        local_kv_lens,
-        local_kv_lens_cumsum,
-        local_kv_indices,
-        dcp_rank=get_dcp_rank(),
-        dcp_world_size=get_dcp_world_size(),
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    if is_npu():
+        update_kv_lens_and_indices_torch(
+            kv_lens,
+            kv_indptr,
+            kv_indices,
+            local_kv_lens,
+            local_kv_lens_cumsum,
+            local_kv_indices,
+            dcp_rank=get_dcp_rank(),
+            dcp_world_size=get_dcp_world_size(),
+        )
+    else:
+        update_kv_lens_and_indices[grid](
+            kv_lens,
+            kv_indptr,
+            kv_indices,
+            local_kv_lens,
+            local_kv_lens_cumsum,
+            local_kv_indices,
+            dcp_rank=get_dcp_rank(),
+            dcp_world_size=get_dcp_world_size(),
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
     kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
     kv_lens.copy_(local_kv_lens)
     kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]

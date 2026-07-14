@@ -1091,6 +1091,12 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
+        # Detect DCP mode for extend (decode context parallel)
+        is_dcp_mode = (
+            forward_batch.attn_dcp_metadata is not None
+            and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
+        )
+
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
@@ -1533,7 +1539,7 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
-        elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
+        elif sum(forward_batch.extend_prefix_lens_cpu) > 0 and not is_dcp_mode:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
             # we use the FIA kernel for computation.
@@ -1706,6 +1712,149 @@ class AscendAttnBackend(AttentionBackend):
                         ],
                         dim=0,
                     )
+        elif sum(forward_batch.extend_prefix_lens_cpu) > 0 and is_dcp_mode:
+            # DCP extend (MLA): follows the same two-stage ring_mla pattern as
+            # L1611-1714, but loads prefix KV from all-gathered dcp_kv_buffer
+            # instead of token_to_kv_pool.
+            dcp_meta = forward_batch.attn_dcp_metadata
+            dcp_kv_buf = dcp_meta.dcp_kv_buffer
+            dcp_kv_indptr = dcp_meta.dcp_kv_indptr
+            dcp_kv_indices = dcp_meta.dcp_kv_indices
+
+            num_token_padding = q.shape[0]
+            q, k, v = [
+                data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+            ]
+            q_nope, q_rope = q.split(
+                [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_nope, k_rope = k.split(
+                [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+
+            # Stage 1: compute extend self-attention via ring_mla first_ring
+            num_tokens = q_nope.size(0)
+            attn_output = torch.zeros(
+                num_tokens,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            attn_lse = torch.zeros(
+                layer.tp_q_head_num,
+                num_tokens,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+            torch_npu.atb.npu_ring_mla(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                k_nope=k_nope,
+                k_rope=k_rope,
+                value=v,
+                mask=self.ringmla_mask,
+                seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
+                head_num=layer.tp_q_head_num,
+                kv_head_num=layer.tp_k_head_num,
+                pre_out=None,
+                prev_lse=None,
+                qk_scale=layer.scaling,
+                kernel_type="kernel_type_high_precision",
+                mask_type="mask_type_triu",
+                calc_type="calc_type_first_ring",
+                output=attn_output,
+                softmax_lse=attn_lse,
+            )
+
+            # Stage 2: load prefix KV from all-gathered dcp_kv_buffer,
+            # expand latent k_nope via kv_b_proj, then ring_mla default calc.
+            prefix_k_list = []
+            prefix_k_rope_list = []
+            prefix_lens_list = []
+            for req_idx in range(len(forward_batch.extend_seq_lens_cpu)):
+                prefix_len = int(forward_batch.extend_prefix_lens_cpu[req_idx])
+                if prefix_len == 0:
+                    prefix_lens_list.append(
+                        torch.tensor(0, device=q.device, dtype=torch.int32)
+                    )
+                    continue
+                kv_start = int(dcp_kv_indptr[req_idx])
+                kv_end = kv_start + prefix_len
+                prefix_indices = dcp_kv_indices[kv_start:kv_end]
+                prefix_gather = torch.index_select(
+                    dcp_kv_buf, 0, prefix_indices
+                )  # [prefix_len, 1, kv_lora_rank+rope]
+                prefix_k_list.append(
+                    prefix_gather[..., : layer.kv_lora_rank]
+                )  # latent k_nope
+                prefix_k_rope_list.append(
+                    prefix_gather[..., layer.kv_lora_rank :]
+                )  # k_rope
+                prefix_lens_list.append(
+                    torch.tensor(prefix_len, device=q.device, dtype=torch.int32)
+                )
+
+            if len(prefix_k_list) > 0:
+                prefix_k_nope = torch.cat(prefix_k_list, dim=0)
+                prefix_k_rope = torch.cat(prefix_k_rope_list, dim=0)
+                prefix_lens = torch.stack(prefix_lens_list)
+
+                # Expand latent k_nope → k_nope_head + v via kv_b_proj
+                assert layer.kv_b_proj is not None
+                kv_expanded = layer.kv_b_proj(prefix_k_nope)[0].view(
+                    -1,
+                    layer.tp_k_head_num,
+                    self.qk_nope_head_dim + layer.v_head_dim,
+                )
+                k_nope_prefix, v_prefix = kv_expanded.split(
+                    [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+                )
+                k_rope_prefix = prefix_k_rope.expand(
+                    -1, layer.tp_k_head_num, -1
+                )
+
+                seq_len = torch.stack(
+                    [
+                        self.forward_metadata.extend_seq_lens_cpu_int,
+                        prefix_lens,
+                    ]
+                )
+                torch_npu.atb.npu_ring_mla(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    k_nope=k_nope_prefix,
+                    k_rope=k_rope_prefix,
+                    value=v_prefix,
+                    mask=self.ringmla_mask,
+                    seqlen=seq_len,
+                    head_num=layer.tp_q_head_num,
+                    kv_head_num=layer.tp_k_head_num,
+                    pre_out=attn_output,
+                    prev_lse=attn_lse,
+                    qk_scale=layer.scaling,
+                    kernel_type="kernel_type_high_precision",
+                    mask_type="no_mask",
+                    calc_type="calc_type_default",
+                    output=attn_output,
+                    softmax_lse=attn_lse,
+                )
+
+            attn_output = attn_output.reshape(
+                [-1, layer.tp_q_head_num, layer.v_head_dim]
+            )
+            if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                attn_output = torch.cat(
+                    [
+                        attn_output,
+                        attn_output.new_zeros(
+                            num_token_padding - attn_output.shape[0],
+                            *attn_output.shape[1:],
+                        ),
+                    ],
+                    dim=0,
+                )
+            return attn_output
         else:
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""

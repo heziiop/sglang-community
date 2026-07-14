@@ -16,6 +16,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.dcp.comm import (
+    all_gather_kv_cache_for_mla_extend,
+    dcp_enabled,
+)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
@@ -77,7 +81,7 @@ def forward_mha_prepare_npu(
     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
-    if m.use_deepseek_yarn_rope:
+    if m.use_deepseek_yarn_rope and not dcp_enabled():
         B, S = q.shape[0], 1
         cos, sin = m.rotary_emb.get_cos_sin_cache(
             positions, hidden_states.dtype, offsets=None
@@ -119,6 +123,21 @@ def forward_mha_prepare_npu(
         )
 
     q[..., m.qk_nope_head_dim :] = q_pe
+
+    if dcp_enabled() and forward_batch.forward_mode.is_extend():
+        # All-gather prefix KV from all DCP ranks into dcp_kv_buffer,
+        # and append local extend KV (matching GPU forward_absorb_prepare).
+        all_gather_kv_cache_for_mla_extend(
+            get_token_to_kv_pool(),
+            m.attn_mqa,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+            forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+            forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+            m.kv_lora_rank,
+            kv_a.unsqueeze(1),                   # latent K [T, 1, kv_lora_rank]
+            k_pe.view(-1, 1, m.qk_rope_head_dim), # latent rope [T, 1, rope_dim]
+        )
 
     kv = m.kv_b_proj(kv_a)[0]
     kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)

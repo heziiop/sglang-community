@@ -1725,7 +1725,7 @@ class DeepseekV2AttentionMLA(
                 layer_id=layer_id,
                 v_head_dim=self.kv_lora_rank,
                 quant_config=quant_config,
-                prefix=add_prefix("attn_mqa", prefix),
+                prefix=add_prefix("attn_mqa_dcp", prefix),
             )
 
         self.attn_mha = RadixAttention(
@@ -2927,6 +2927,79 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        """
+        构造 DCP（Decode Context Parallel）extend/prefill 路径所需的元数据。
+
+        每个 forward batch 开始时调用一次，返回 ``DecodeContextParallelMetadata``，
+        描述 DCP 各 rank 的 KV cache 在 **dcp_kv_buffer** 中的布局。
+        dcp_kv_buffer 是一个平坦张量，包含 all-gather 来的 prefix KV（所有 rank 的）
+        加上本 rank 当前 extend 的 KV。
+
+        **产物**（存储在 ``DecodeContextParallelMetadata`` 中）：
+
+        ┌─────────────────────────────┬──────────────────────┬──────────────────────────┐
+        │ 字段                         │ shape / dtype         │ 作用                     │
+        ├─────────────────────────────┼──────────────────────┼──────────────────────────┤
+        │ dcp_kv_buffer               │ [T, 1, L+Q]  float   │ 注意力计算用的 KV 缓冲。  │
+        │                             │ T = sum(seq_lens)    │ 本函数只分配空张量，后续  │
+        │                             │ L = kv_lora_rank     │ 由 all_gather 填充。      │
+        │                             │ Q = qk_rope_head_dim │                          │
+        │                             │ 最后一维前半是 kv_to- │                          │
+        │                             │ ra_rank（nope），后-  │                          │
+        │                             │ 半是 qk_rope_head_-  │                          │
+        │                             │ dim（rope）。         │                          │
+        ├─────────────────────────────┼──────────────────────┼──────────────────────────┤
+        │ dcp_kv_indptr               │ [bs+1]  int32        │ 每个请求在 dcp_kv_buffer  │
+        │                             │ cumsum(seq_lens)     │ 中的起止位置。请求 i 对-  │
+        │                             │                      │ 应的 KV 区间是            │
+        │                             │                      │ [indptr[i], indptr[i+1]) │
+        ├─────────────────────────────┼──────────────────────┼──────────────────────────┤
+        │ dcp_kv_indices              │ [T]  int32           │ 指向 dcp_kv_buffer 的索-  │
+        │                             │                      │ 引。prefix 段指向 all-    │
+        │                             │                      │ gather 后的全局 prefix    │
+        │                             │                      │ 块；extend 段指向 buffer  │
+        │                             │                      │ 末尾的 extend 尾部。      │
+        ├─────────────────────────────┼──────────────────────┼──────────────────────────┤
+        │ dcp_local_prefix_kv_indices │ [P']  int32          │ 本 rank **拥有**的 prefix │
+        │                             │ P' = 本 rank 拥有的  │ KV 的**本地索引**（已按   │
+        │                             │      prefix token 数 │ owner-rule 过滤，并除以    │
+        │                             │                      │ dcp_world_size）。用于从  │
+        │                             │                      │ 本 rank 的 KV pool 读取   │
+        │                             │                      │ 自己的 prefix KV。        │
+        ├─────────────────────────────┼──────────────────────┼──────────────────────────┤
+        │ dcp_extend_prefix_lens_sum  │ Python int           │ 所有请求的 prefix token   │
+        │                             │                      │ 总数。标记 dcp_kv_buffer  │
+        │                             │                      │ 中 prefix 区域和 extend   │
+        │                             │                      │ 区域的分界线。            │
+        └─────────────────────────────┴──────────────────────┴──────────────────────────┘
+
+        **dcp_kv_buffer 内存布局：**
+
+        buffer 由两个连续区域组成 —— prefix（all-gather 的全局前缀）和 extend
+        （本 rank 本地 extend）。假设 DCP 有 N 个 rank，本次有 M 个请求（bs=M）：
+
+            [ rank0_req1.prefix, rank1_req1.prefix, ... rank_{N-1}_req1.prefix,
+              rank0_req2.prefix, rank1_req2.prefix, ... rank_{N-1}_req2.prefix,
+              ...
+              rank0_reqM.prefix, rank1_reqM.prefix, ... rank_{N-1}_reqM.prefix,
+              req1.extend, req2.extend, ..., reqM.extend ]
+
+        - **Prefix 区域**（偏移 [0, dcp_extend_prefix_lens_sum)）：
+          每个请求的 prefix token 按 **rank 交织**排列。这是因为 prefix KV 已通过
+          HCCL/NCCL all-gather 到每个 rank，所以所有 rank 的 prefix 都连续放在一起。
+          顺序是：先按请求，再按 rank。
+
+        - **Extend 区域**（偏移 [dcp_extend_prefix_lens_sum, T)）：
+          仅包含本 rank 当前的 extend token。顺序：按请求。
+          
+        - dcp_kv_buffer[dcp_kv_indices] gather后就是按req排布，prefix和extend也拼接了，
+          此时每个req的kv区间就是[dcp_kv_indptr[i], dcp_kv_indptr[i+1])
+        
+        - dcp_local_prefix_kv_indices: 在 all-gather prefix KV 之前，每个 rank 先从
+          自己的 KV pool 里读出 自己拥有的 prefix token。 dcp_local_prefix_kv_indices 就是已经过滤好的本地物理索引。
+        
+        - dcp_extend_prefix_lens_sum: dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv  # ← 写入 buffer
+        """
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
