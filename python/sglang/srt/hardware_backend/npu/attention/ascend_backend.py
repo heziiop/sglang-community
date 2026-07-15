@@ -22,6 +22,11 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dcp.comm import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -2870,7 +2875,25 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_q_head_num,
                     self.qk_rope_head_dim,
                 )
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                return_lse = kwargs.get("return_lse", False)
+                if dcp_enabled():
+                    dcp_ws = get_attention_dcp_world_size()
+                    dcp_rk = get_attention_dcp_rank()
+                    seq_lens = self.forward_metadata.seq_lens_cpu_int
+                    # Per-rank KV length: ceil(len/dcp_size) for rank < len%dcp_size, floor otherwise
+                    dcp_seq_lens = seq_lens // dcp_ws + (dcp_rk < seq_lens % dcp_ws)
+                    seq_lens_max = forward_batch.seq_lens.max()
+                    dcp_page_size = self.page_size * dcp_ws
+                    block_tables = (
+                        self.req_to_token_pool.req_to_token[
+                            forward_batch.req_pool_indices, :seq_lens_max
+                        ][:, :: dcp_page_size]
+                        // dcp_page_size
+                    )
+                else:
+                    dcp_seq_lens = self.forward_metadata.seq_lens_cpu_int
+                    block_tables = self.forward_metadata.block_tables
+                attn_output, softmax_lse = torch.ops.npu.npu_fused_infer_attention_score(
                     q,
                     kv_c,
                     kv_c,
@@ -2884,10 +2907,15 @@ class AscendAttnBackend(AttentionBackend):
                     scale=layer.scaling,
                     antiquant_mode=0,
                     antiquant_scale=None,
-                    block_table=self.forward_metadata.block_tables,
+                    block_table=block_tables,
                     block_size=self.page_size,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    actual_seq_lengths_kv=dcp_seq_lens,
+                    softmax_lse_flag=return_lse,
                 )
+                if return_lse:
+                    return attn_output.view(
+                        num_tokens, layer.tp_q_head_num * self.kv_lora_rank
+                    ), softmax_lse
             else:
                 assert (
                     self.graph_mode == False

@@ -18,8 +18,12 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_mla_extend,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla,
     dcp_enabled,
+    get_attention_dcp_world_size,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
@@ -281,6 +285,10 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+    # DCP decode: all-gather Q across DCP ranks (head count expands *dcp_world_size)
+    if forward_batch.forward_mode.is_decode() and dcp_enabled():
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+
     return (
         q_pe,
         k_pe,
@@ -304,15 +312,34 @@ def forward_mla_core_npu(
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
-        q_nope_out,
-        k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-    )
+    if forward_batch.forward_mode.is_decode() and dcp_enabled():
+        attn_output, lse = m.attn_mqa_for_dcp_decode(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            return_lse=True,
+        )
+        # Merge partial attention outputs across DCP ranks
+        attn_output = attn_output.view(
+            -1,
+            m.num_local_heads * get_attention_dcp_world_size(),
+            m.kv_lora_rank,
+        )
+        attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+        attn_output = attn_output.transpose(0, 1)
+    else:
+        attn_output = m.attn_mqa(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
