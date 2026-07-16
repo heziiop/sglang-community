@@ -131,7 +131,7 @@ def forward_mha_prepare_npu(
     if dcp_enabled() and forward_batch.forward_mode.is_extend():
         # All-gather prefix KV from all DCP ranks into dcp_kv_buffer,
         # and append local extend KV (matching GPU forward_absorb_prepare).
-        all_gather_kv_cache_for_mla_extend(
+        forward_batch.attn_dcp_metadata.dcp_kv_buffer = all_gather_kv_cache_for_mla_extend(
             get_token_to_kv_pool(),
             m.attn_mqa,
             forward_batch.extend_prefix_lens_cpu,
@@ -313,6 +313,9 @@ def forward_mla_core_npu(
     topk_indices: torch.Tensor,
 ) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode() and dcp_enabled():
+        # Set mha_return_lse so the attention backend knows to return LSE
+        # for online softmax merge across DCP ranks (matching GPU backends).
+        forward_batch.mha_return_lse = True
         attn_output, lse = m.attn_mqa_for_dcp_decode(
             q_nope_out,
             k_nope,

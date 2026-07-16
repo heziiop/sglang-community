@@ -2850,7 +2850,14 @@ class AscendAttnBackend(AttentionBackend):
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
+            # DCP decode requires FIA (LSE return for online softmax merge).
+            # Force FIA when DCP is active even if ASCEND_USE_FIA is not set.
+            _use_fia = self.use_fia or dcp_enabled()
+            _head_ratio = layer.tp_q_head_num // layer.tp_k_head_num
+            # DCP decode relaxes the head-ratio requirement to support models
+            # with fewer attention heads (e.g., DeepSeek-V2-Lite: 16 heads / tp8 → 4 local).
+            _fia_min_ratio = 4 if dcp_enabled() else 8
+            if _use_fia and _head_ratio >= _fia_min_ratio:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
@@ -2875,7 +2882,14 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_q_head_num,
                     self.qk_rope_head_dim,
                 )
-                return_lse = kwargs.get("return_lse", False)
+                # DCP decode requires LSE for online softmax merge across ranks.
+                # Prefer forward_batch.mha_return_lse (set by MLA module for DCP),
+                # fall back to kwargs (for backward compat) and dcp_enabled().
+                return_lse = (
+                    forward_batch.mha_return_lse
+                    or kwargs.get("return_lse", False)
+                    or dcp_enabled()
+                )
                 if dcp_enabled():
                     dcp_ws = get_attention_dcp_world_size()
                     dcp_rk = get_attention_dcp_rank()
@@ -2893,6 +2907,9 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     dcp_seq_lens = self.forward_metadata.seq_lens_cpu_int
                     block_tables = self.forward_metadata.block_tables
+                # Always request LSE and return it — DCP decode needs it for
+                # online-softmax merge. The backend inspects forward_batch.mha_return_lse
+                # and dcp_enabled() to decide whether the caller actually uses it.
                 attn_output, softmax_lse = torch.ops.npu.npu_fused_infer_attention_score(
                     q,
                     kv_c,
@@ -2910,13 +2927,29 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=block_tables,
                     block_size=self.page_size,
                     actual_seq_lengths_kv=dcp_seq_lens,
-                    softmax_lse_flag=return_lse,
+                    softmax_lse_flag=True,  # Always compute LSE in FIA path
                 )
                 if return_lse:
+                    # FIA BSND layout returns LSE with shape [B, S, H, 1];
+                    # squeeze to [B, H] expected by DCP LSE merge kernels.
+                    lse_squeezed = softmax_lse.squeeze(-1).squeeze(-1)
+                    if lse_squeezed.ndim == 3:
+                        lse_squeezed = lse_squeezed.squeeze(1)  # remove S dim
                     return attn_output.view(
                         num_tokens, layer.tp_q_head_num * self.kv_lora_rank
-                    ), softmax_lse
+                    ), lse_squeezed
+                else:
+                    return attn_output.view(
+                        num_tokens, layer.tp_q_head_num * self.kv_lora_rank
+                    )
             else:
+                # Non-FIA path: does NOT support DCP decode (no LSE return).
+                # Raise a clear error so the user knows to set ASCEND_USE_FIA=1.
+                if dcp_enabled():
+                    raise RuntimeError(
+                        "DCP decode requires the FIA attention kernel. "
+                        "Set environment variable ASCEND_USE_FIA=1."
+                    )
                 assert (
                     self.graph_mode == False
                 )  # _npu_paged_attention_mla not support graph mode

@@ -242,31 +242,49 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # All-gather prefix KV from all DCP ranks when there are prefix tokens.
+    # Skip when no prefix (first batch / empty prefix) to avoid launching
+    # get_mla_kv_buffer_kernel with coreDim=0 on NPU.
+    if dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    extend_start = dcp_extend_prefix_lens_sum
+    extend_end = extend_start + k_nope.shape[0]
+    if extend_end > dcp_kv_buffer.shape[0]:
+        # Resize buffer if pre-allocated size doesn't match actual token count
+        # (e.g., warmup padding adds extra tokens not accounted in seq_lens_sum).
+        new_buffer = torch.empty(
+            (extend_end, 1, kv_lora_rank + k_pe.shape[-1]),
+            dtype=dcp_kv_buffer.dtype,
+            device=dcp_kv_buffer.device,
+        )
+        if dcp_extend_prefix_lens_sum > 0:
+            new_buffer[:dcp_extend_prefix_lens_sum] = dcp_kv_buffer[:dcp_extend_prefix_lens_sum]
+        dcp_kv_buffer = new_buffer
     dcp_kv_buffer[
-        dcp_extend_prefix_lens_sum:,
+        extend_start:extend_end,
         ...,
         :kv_lora_rank,
     ] = k_nope
     dcp_kv_buffer[
-        dcp_extend_prefix_lens_sum:,
+        extend_start:extend_end,
         ...,
         kv_lora_rank:,
     ] = k_pe
+    return dcp_kv_buffer
 
 
 # all gather kv cache and re-org to query orders

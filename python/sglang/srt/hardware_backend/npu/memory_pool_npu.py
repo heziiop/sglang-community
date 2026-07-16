@@ -435,6 +435,46 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        # Override MLATokenToKVPool.get_mla_kv_buffer to handle NPU's paged
+        # layout and separate k/v buffers. GPU uses one flat buffer with
+        # nope+rope concatenated; NPU stores them in separate paged buffers.
+        layer_id = layer.layer_id
+        dst_dtype = dst_dtype or self.dtype
+
+        # Flatten page buffers to a flat token layout matching the flat loc
+        # indices (same approach as set_kv_buffer which uses .view(-1, 1, ...)).
+        k_flat = self.k_buffer[layer_id - self.start_layer].view(
+            -1, 1, self.kv_lora_rank
+        )
+        v_flat = self.v_buffer[layer_id - self.start_layer].view(
+            -1, 1, self.qk_rope_head_dim
+        )
+
+        cache_k_nope = torch.empty(
+            (loc.shape[0], 1, self.kv_lora_rank),
+            dtype=dst_dtype,
+            device=k_flat.device,
+        )
+        cache_k_rope = torch.empty(
+            (loc.shape[0], 1, self.qk_rope_head_dim),
+            dtype=dst_dtype,
+            device=v_flat.device,
+        )
+
+        if loc.numel() == 0:
+            return cache_k_nope, cache_k_rope
+
+        # Read from flattened buffers using flat loc indices
+        cache_k_nope.copy_(k_flat[loc])
+        cache_k_rope.copy_(v_flat[loc])
+        return cache_k_nope, cache_k_rope
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",

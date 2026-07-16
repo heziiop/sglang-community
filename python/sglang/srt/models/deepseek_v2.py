@@ -3000,6 +3000,16 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         
         - dcp_extend_prefix_lens_sum: dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv  # ← 写入 buffer
         """
+        # On NPU, the kv pool uses a paged layout [num_pages, page_size, 1, kv_lora_rank],
+        # while DCP needs a flat layout [T, 1, kv_lora_rank + qk_rope_head_dim].
+        # Construct the correct buffer shape so that dcp_kv_buffer is allocated properly.
+        if _is_npu:
+            kv_buffer_shape_for_dcp = torch.Size(
+                [1, 1, self.config.kv_lora_rank + self.config.qk_rope_head_dim]
+            )
+        else:
+            kv_buffer_shape_for_dcp = kv_buffer_shape
+
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3008,7 +3018,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
             seq_lens_sum=seq_lens_sum,
-            kv_buffer_shape=kv_buffer_shape,
+            kv_buffer_shape=kv_buffer_shape_for_dcp,
             kv_cache_dtype=kv_cache_dtype,
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
