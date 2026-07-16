@@ -1781,7 +1781,7 @@ class AscendAttnBackend(AttentionBackend):
                 prefix_len = int(forward_batch.extend_prefix_lens_cpu[req_idx])
                 if prefix_len == 0:
                     prefix_lens_list.append(
-                        torch.tensor(0, device=q.device, dtype=torch.int32)
+                        torch.tensor(0, dtype=torch.int32)
                     )
                     continue
                 kv_start = int(dcp_kv_indptr[req_idx])
@@ -1791,13 +1791,13 @@ class AscendAttnBackend(AttentionBackend):
                     dcp_kv_buf, 0, prefix_indices
                 )  # [prefix_len, 1, kv_lora_rank+rope]
                 prefix_k_list.append(
-                    prefix_gather[..., : layer.kv_lora_rank]
+                    prefix_gather[..., : self.kv_lora_rank]
                 )  # latent k_nope
                 prefix_k_rope_list.append(
-                    prefix_gather[..., layer.kv_lora_rank :]
+                    prefix_gather[..., self.kv_lora_rank :]
                 )  # k_rope
                 prefix_lens_list.append(
-                    torch.tensor(prefix_len, device=q.device, dtype=torch.int32)
+                    torch.tensor(prefix_len, dtype=torch.int32)
                 )
 
             if len(prefix_k_list) > 0:
