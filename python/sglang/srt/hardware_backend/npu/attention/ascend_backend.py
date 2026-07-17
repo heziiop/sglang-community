@@ -359,11 +359,9 @@ class AscendAttnBackend(AttentionBackend):
                 model_runner.model_config.num_attention_heads // get_attention_tp_size()
             )
             # DCP decode expands Q head count by dcp_world_size (all-gather Q).
-            # Reserve enough padding for the expanded head count.
-            _dcp_ws = get_attention_dcp_world_size()
-            _max_q_heads = self.tp_q_head_num * _dcp_ws
+            self.tp_q_head_num *= get_attention_dcp_world_size()
             for num in self.padding_size_list:
-                if num >= _max_q_heads:
+                if num >= self.tp_q_head_num:
                     self.q_head_num_padding = num
                     break
 
