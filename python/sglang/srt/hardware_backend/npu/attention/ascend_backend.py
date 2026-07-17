@@ -358,8 +358,12 @@ class AscendAttnBackend(AttentionBackend):
             self.tp_q_head_num = (
                 model_runner.model_config.num_attention_heads // get_attention_tp_size()
             )
+            # DCP decode expands Q head count by dcp_world_size (all-gather Q).
+            # Reserve enough padding for the expanded head count.
+            _dcp_ws = get_attention_dcp_world_size()
+            _max_q_heads = self.tp_q_head_num * _dcp_ws
             for num in self.padding_size_list:
-                if num >= self.tp_q_head_num:
+                if num >= _max_q_heads:
                     self.q_head_num_padding = num
                     break
 
@@ -532,6 +536,14 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        # DCP decode needs its own block_table (different stride: dcp_page_size).
+        if dcp_enabled():
+            dcp_page_size = self.page_size * get_attention_dcp_world_size()
+            self.graph_metadata["dcp_block_tables"] = torch.zeros(
+                (max_bs, total_context_len // dcp_page_size),
+                dtype=torch.int32,
+                device=self.device,
+            )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -579,6 +591,8 @@ class AscendAttnBackend(AttentionBackend):
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if dcp_enabled() and "dcp_block_tables" in self.graph_metadata:
+            metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
@@ -696,6 +710,18 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+
+        # DCP decode: fill the pre-allocated DCP block_table (different stride).
+        if dcp_enabled() and "dcp_block_tables" in self.graph_metadata:
+            dcp_ws = get_attention_dcp_world_size()
+            dcp_page_size = self.page_size * dcp_ws
+            dcp_src = (
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : dcp_page_size]
+                // dcp_page_size
+            )
+            dcp_pages = dcp_src.shape[1]
+            metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_src)
+            metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
@@ -2526,6 +2552,49 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
+            # DCP decode: adjust block_table and seq_lens for per-rank KV shard.
+            if dcp_enabled():
+                dcp_ws = get_attention_dcp_world_size()
+                dcp_rk = get_attention_dcp_rank()
+                dcp_page_size = self.page_size * dcp_ws
+                # During graph capture seq_lens_cpu_int may be None; fall back to list.
+                if self.forward_metadata.seq_lens_cpu_int is not None:
+                    seq_lens = self.forward_metadata.seq_lens_cpu_int
+                    dcp_seq_lens = seq_lens // dcp_ws + (dcp_rk < seq_lens % dcp_ws)
+                    actual_seq_len_kv = dcp_seq_lens.cpu().int().tolist()
+                else:
+                    seq_lens_list = self.forward_metadata.seq_lens_cpu_list
+                    dcp_seq_lens_list = [
+                        s // dcp_ws + (1 if dcp_rk < s % dcp_ws else 0)
+                        for s in seq_lens_list
+                    ]
+                    actual_seq_len_kv = dcp_seq_lens_list
+                # Use pre-allocated DCP block_table buffer (graph capture requires
+                # fixed-size input tensors; .max() on GPU tensor implies sync).
+                if self.graph_mode and "dcp_block_tables" in self.graph_metadata:
+                    # In graph mode, use the pre-filled DCP block_table from
+                    # graph_metadata (filled during init_forward_metadata).
+                    # Avoid .copy_() which is not allowed during NPU graph capture.
+                    block_tables = self.graph_metadata["dcp_block_tables"][
+                        : forward_batch.req_pool_indices.shape[0]
+                    ]
+                else:
+                    seq_lens_max = forward_batch.seq_lens.max()
+                    block_tables = (
+                        self.req_to_token_pool.req_to_token[
+                            forward_batch.req_pool_indices, :seq_lens_max
+                        ][:, :: dcp_page_size]
+                        // dcp_page_size
+                    )
+                    block_tables = (
+                        self.req_to_token_pool.req_to_token[
+                            forward_batch.req_pool_indices, :seq_lens_max
+                        ][:, :: dcp_page_size]
+                        // dcp_page_size
+                    )
+            else:
+                block_tables = self.forward_metadata.block_tables
+
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 q_nope,
                 c_kv_cache,
@@ -2534,7 +2603,7 @@ class AscendAttnBackend(AttentionBackend):
                 key_rope=k_rope_cache,
                 num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_tables,
                 block_size=self.page_size,
                 input_layout="BSND",
                 scale=layer.scaling,
@@ -2544,7 +2613,12 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode=0,
             )
             output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+            # BSND layout LSE shape: [batch, seq=1, heads, 1].
+            softmax_lse = torch.empty(
+                (q_nope.shape[0], 1, q_nope.shape[2], 1),
+                dtype=q.dtype,
+                device=q.device,
+            )
 
             torch_npu.npu_fused_infer_attention_score.out(
                 q_nope,
@@ -2554,7 +2628,7 @@ class AscendAttnBackend(AttentionBackend):
                 key_rope=k_rope_cache,
                 num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_tables,
                 block_size=self.page_size,
                 input_layout="BSND",
                 scale=layer.scaling,
@@ -2567,7 +2641,15 @@ class AscendAttnBackend(AttentionBackend):
             )
 
             output = output[:, :, : layer.tp_q_head_num, :]
-            return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+            attn_output = output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+
+            # DCP decode requires LSE for online softmax merge across ranks.
+            if forward_batch.mha_return_lse:
+                lse_squeezed = softmax_lse.squeeze(-1).squeeze(-1)
+                if lse_squeezed.ndim == 3:
+                    lse_squeezed = lse_squeezed.squeeze(1)
+                return attn_output, lse_squeezed
+            return attn_output
 
     def forward_decode(
         self,

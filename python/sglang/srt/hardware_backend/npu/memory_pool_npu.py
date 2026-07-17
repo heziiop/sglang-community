@@ -498,14 +498,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
 
         if dcp_enabled():
-            valid_mask = (
-                loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
-            )
-            if not valid_mask.all():
+            dcp_ws = get_attention_dcp_world_size()
+            dcp_rk = get_attention_dcp_rank()
+            valid_mask = loc % dcp_ws == dcp_rk
+            # During NPU graph capture/replay, tensor shapes must remain fixed.
+            # Skip owner-rule filtering in graph mode (each rank writes all tokens;
+            # memory savings from DCP are preserved in the attention path via
+            # dcp_seq_lens / dcp_block_tables).
+            if not torch.npu.is_current_stream_capturing():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
                 cache_v = cache_v[valid_mask]
-            loc = loc // get_attention_dcp_world_size()
+            loc = loc // dcp_ws
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
