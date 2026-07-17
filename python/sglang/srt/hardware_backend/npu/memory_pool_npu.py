@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.dcp.comm import dcp_enabled, get_attention_dcp_rank, get_attention_dcp_world_size
+
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -497,20 +497,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
-        if dcp_enabled():
-            dcp_ws = get_attention_dcp_world_size()
-            dcp_rk = get_attention_dcp_rank()
-            valid_mask = loc % dcp_ws == dcp_rk
-            # During NPU graph capture/replay, tensor shapes must remain fixed.
-            # Skip owner-rule filtering in graph mode (each rank writes all tokens;
-            # memory savings from DCP are preserved in the attention path via
-            # dcp_seq_lens / dcp_block_tables).
-            if not torch.npu.is_current_stream_capturing():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
-                cache_v = cache_v[valid_mask]
-            loc = loc // dcp_ws
-
+        # DCP owner rule is now applied in init_forward_metadata, which
+        # transforms out_cache_loc once per batch (-1 for non-owned slots).
+        # No per-layer filtering or scaling needed here.
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),

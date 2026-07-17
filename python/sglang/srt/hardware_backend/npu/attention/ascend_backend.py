@@ -432,6 +432,18 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        # DCP: transform out_cache_loc in-place before any layer runs.
+        # Apply owner rule: non-owned tokens → -1, owned tokens → loc // dcp_ws.
+        # npu_scatter_nd_update_ silently skips -1 indices. Shape stays
+        # unchanged throughout → no graph-compatibility hacks needed.
+        if dcp_enabled() and forward_batch.out_cache_loc is not None:
+            dcp_ws = get_attention_dcp_world_size()
+            dcp_rk = get_attention_dcp_rank()
+            loc = forward_batch.out_cache_loc
+            valid = loc % dcp_ws == dcp_rk
+            loc.copy_(torch.where(valid, loc // dcp_ws,
+                                  torch.full_like(loc, -1)))
+
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
