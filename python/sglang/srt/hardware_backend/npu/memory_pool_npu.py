@@ -434,6 +434,47 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        # Override MLATokenToKVPool.get_mla_kv_buffer to handle NPU's paged
+        # layout and separate k/v buffers. GPU uses one flat buffer with
+        # nope+rope concatenated; NPU stores them in separate paged buffers.
+        dst_dtype = dst_dtype or self.dtype
+        if loc.numel() == 0:
+            return (
+                torch.empty(
+                    (0, 1, self.kv_lora_rank),
+                    dtype=dst_dtype,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (0, 1, self.qk_rope_head_dim),
+                    dtype=dst_dtype,
+                    device=self.device,
+                ),
+            )
+
+        # Keep token-index semantics: chunked prefix paths may request partial
+        # pages. index_select avoids the advanced-index temporary plus copy_,
+        # while the getters preserve layer-transfer synchronization and logical
+        # dtype views when the cache is stored as raw bytes.
+        k_flat = self.get_key_buffer(layer.layer_id).view(
+            -1, 1, self.kv_lora_rank
+        )
+        v_flat = self.get_value_buffer(layer.layer_id).view(
+            -1, 1, self.qk_rope_head_dim
+        )
+        cache_k_nope = torch.index_select(k_flat, 0, loc)
+        cache_k_rope = torch.index_select(v_flat, 0, loc)
+        if cache_k_nope.dtype != dst_dtype:
+            cache_k_nope = cache_k_nope.to(dst_dtype)
+            cache_k_rope = cache_k_rope.to(dst_dtype)
+        return cache_k_nope, cache_k_rope
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",

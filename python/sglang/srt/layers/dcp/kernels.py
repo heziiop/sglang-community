@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
 
 # ---------------------------------------------------------------------------
 # KV-index build (PR #25090, Triton/MHA): per-rank local KV indices.
@@ -276,6 +278,9 @@ def correct_attn_out(
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
     """
+    if is_npu():
+        return correct_attn_out_torch(out, lses, cp_rank, new_output)
+
     if ctx is None:
         ctx = CPTritonContext()
 
@@ -331,3 +336,69 @@ def correct_attn_out(
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
+
+
+def correct_attn_out_torch(
+    out: torch.Tensor,
+    lses: torch.Tensor,
+    cp_rank: int,
+    new_output: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch fallback for ``correct_attn_out`` / ``_correct_attn_cp_out_kernel``.
+
+    Merges partial attention outputs from different DCP ranks using the
+    log-sum-exp (LSE) correction:
+        global_lse  = logsumexp(lse_ranks, dim=0)
+        scale       = exp(local_lse - global_lse)
+        corrected   = attn_out * scale
+
+    The caller is responsible for the cross-rank reduction (all-reduce or
+    reduce-scatter) after this function returns.
+
+    Args:
+        out:         Attention output  [B, H, D]  (or [B, 1, H, D])
+        lses:        All-gathered LSE  [N, B, H]  (or with extra dims)
+        cp_rank:     Index of this rank's LSE in lses
+        new_output:  Pre-allocated output buffer [H, B, D] (or None → allocate)
+
+    Returns:
+        (corrected_out [H, B, D], global_lse [B, H])
+    """
+    # --- Normalize to 3D views (same as Triton path) ---
+    if out.ndim == 4 and out.shape[1] == 1:
+        out = out.squeeze(1)
+    assert out.ndim == 3, f"expected out [B,H,D], got {tuple(out.shape)}"
+
+    if lses.ndim == 4 and lses.shape[-1] == 1:
+        lses = lses.squeeze(-1)
+    if lses.ndim == 4 and lses.shape[1] == 1:
+        lses = lses.squeeze(1)
+    assert lses.ndim == 3, (
+        f"expected lses [N,B,H], got {tuple(lses.shape)}"
+    )
+
+    B, H, D = out.shape
+
+    # Global LSE via logsumexp (natural log, equivalent to Triton's log2/exp2
+    # w.r.t. the final scale factor since exp(ln(x))/exp(ln(y)) = exp2(log2(x))/exp2(log2(y)))
+    global_lse = torch.logsumexp(lses, dim=0)  # [B, H]
+    local_lse = lses[cp_rank]  # [B, H]
+
+    scale = torch.nan_to_num(
+        torch.exp(local_lse - global_lse),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )  # [B, H]
+
+    # Apply correction: attn_out *= scale
+    corrected = out * scale.unsqueeze(-1)  # [B, H, D]
+
+    # Transpose to [H, B, D] layout expected by cp_lse_ag_out_rs_mla
+    if new_output is None:
+        new_output = corrected.transpose(0, 1).contiguous()  # [H, B, D]
+    else:
+        new_output.copy_(corrected.transpose(0, 1))
+
+    return new_output, global_lse

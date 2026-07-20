@@ -2846,12 +2846,21 @@ class ServerArgs:
                     f"dcp_size={self.dcp_size} on a CUDA platform with "
                     "speculative decoding enabled."
                 )
+        elif is_npu():
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "Decode context parallel (--dcp-size / "
+                    "--decode-context-parallel-size > 1) on Ascend NPU platform "
+                    "does not support any speculative algorithm, but got "
+                    f"dcp_size={self.dcp_size} on an NPU platform with "
+                    "speculative decoding enabled."
+                )
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
                 "--decode-context-parallel-size > 1) is currently only "
-                f"supported on the AMD HIP platform, but got dcp_size="
-                f"{self.dcp_size} on a non-HIP platform."
+                f"supported on the AMD HIP, CUDA, or Ascend NPU platform, "
+                f"but got dcp_size={self.dcp_size} on an unsupported platform."
             )
 
     def _handle_load_balance_method(self):

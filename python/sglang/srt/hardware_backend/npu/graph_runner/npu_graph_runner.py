@@ -40,7 +40,11 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_dcp_rank,
+    get_dcp_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
@@ -246,6 +250,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
+            if self.model_runner.server_args.dcp_size > 1:
+                dcp_world_size = get_dcp_world_size()
+                dcp_rank = get_dcp_rank()
+                seq_lens = [
+                    seq_len // dcp_world_size
+                    + int(dcp_rank < seq_len % dcp_world_size)
+                    for seq_len in seq_lens
+                ]
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

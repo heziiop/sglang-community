@@ -75,6 +75,23 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 
 
+def _maybe_localize_npu_dcp_out_cache_loc(
+    out_cache_loc: Optional[torch.Tensor], model_runner: ModelRunner
+) -> Optional[torch.Tensor]:
+    """Return the rank-local NPU DCP write view without mutating scheduler state."""
+    dcp_size = getattr(model_runner, "dcp_size", 1)
+    if not _is_npu or dcp_size <= 1 or out_cache_loc is None:
+        return out_cache_loc
+
+    dcp_rank = model_runner.dcp_rank
+    is_local = out_cache_loc % dcp_size == dcp_rank
+    return torch.where(
+        is_local,
+        out_cache_loc // dcp_size,
+        torch.full_like(out_cache_loc, -1),
+    )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -722,6 +739,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+        )
+
+        # ScheduleBatch and req_to_token keep allocator-global slot identities.
+        # Only the runtime ForwardBatch exposes rank-local NPU DCP write slots.
+        ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(
+            ret.out_cache_loc, model_runner
         )
 
         ret._maybe_init_non_generation_fields(batch)

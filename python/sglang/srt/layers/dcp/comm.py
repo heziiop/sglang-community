@@ -35,16 +35,16 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_world_size,
 )
 from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 
 def dcp_enabled() -> bool:
     """
-    only checks whether dcp enabled for cuda platform
+    only checks whether dcp enabled for cuda/npu platform
     """
     if get_dcp_group_no_assert() is None:
         return False
-    if not is_cuda():
+    if not (is_cuda() or is_npu()):
         return False
     return get_dcp_world_size() > 1
 
