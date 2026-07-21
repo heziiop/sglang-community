@@ -283,3 +283,7 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+.trae/
+dcp-npu/
+cp-npu/
+eagle3-support-quarot/
