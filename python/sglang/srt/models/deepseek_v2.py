@@ -2931,8 +2931,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if _is_npu:
             return prepare_npu_dcp_extend_metadata(
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                req_pool_indices=req_pool_indices,
-                req_to_token=req_to_token,
                 kv_cache_dim=(
                     self.config.kv_lora_rank + self.config.qk_rope_head_dim
                 ),

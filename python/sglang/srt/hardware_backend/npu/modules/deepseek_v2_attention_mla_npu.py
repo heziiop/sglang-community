@@ -24,7 +24,10 @@ from sglang.srt.layers.dcp.comm import (
     dcp_enabled,
     get_attention_dcp_world_size,
 )
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -37,21 +40,57 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 def _gather_dcp_prefix_kv(
     token_to_kv_pool,
     attn_mqa,
-    prefix_lens_cpu,
-    local_prefix_kv_indices,
+    metadata,
     prefix_kv_buffer,
 ):
     if prefix_kv_buffer.shape[0] == 0:
         return
 
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, local_prefix_kv_indices
-    )
+    page_size = token_to_kv_pool.page_size
+    local_prefix_lens = metadata.dcp_local_prefix_lens_cpu_int.tolist()
+    page_counts = [
+        (local_prefix_len + page_size - 1) // page_size
+        for local_prefix_len in local_prefix_lens
+    ]
+    page_mask = torch.arange(
+        metadata.dcp_prefix_block_tables.shape[1],
+        device=metadata.dcp_prefix_block_tables.device,
+    ).unsqueeze(0) < torch.tensor(
+        page_counts, device=metadata.dcp_prefix_block_tables.device
+    ).unsqueeze(1)
+    prefix_page_indices = metadata.dcp_prefix_block_tables[page_mask]
+
+    # One DCP allocator page contains one physical KV page from every rank.
+    # The page id is therefore unchanged by the global-slot -> local-slot map.
+    cache_k_nope = torch.index_select(
+        token_to_kv_pool.get_key_buffer(attn_mqa.layer_id), 0, prefix_page_indices
+    ).flatten(0, 1)
+    cache_k_rope = torch.index_select(
+        token_to_kv_pool.get_value_buffer(attn_mqa.layer_id), 0, prefix_page_indices
+    ).flatten(0, 1)
+
+    local_prefix_len = sum(local_prefix_lens)
+    if cache_k_nope.shape[0] != local_prefix_len:
+        page_offsets = [0]
+        for page_count in page_counts:
+            page_offsets.append(page_offsets[-1] + page_count * page_size)
+
+        def trim_partial_pages(cache):
+            return torch.cat(
+                [
+                    cache[start : start + local_len]
+                    for start, local_len in zip(page_offsets, local_prefix_lens)
+                ]
+            )
+
+        cache_k_nope = trim_partial_pages(cache_k_nope)
+        cache_k_rope = trim_partial_pages(cache_k_rope)
+
     prefix_kv_buffer.copy_(
         all_gather_kv_cache_for_dcp(
             cache_k_nope,
             cache_k_rope,
-            torch.as_tensor(prefix_lens_cpu, dtype=torch.int32, device="cpu"),
+            metadata.prefix_lens,
         )
     )
 
@@ -152,11 +191,11 @@ def forward_mha_prepare_npu(
     q[..., m.qk_nope_head_dim :] = q_pe
 
     if dcp_enabled() and forward_batch.forward_mode.is_extend():
+        metadata = get_attn_backend().forward_metadata
         _gather_dcp_prefix_kv(
             get_token_to_kv_pool(),
             m.attn_mqa,
-            forward_batch.extend_prefix_lens_cpu,
-            forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+            metadata,
             forward_batch.attn_dcp_metadata.dcp_kv_buffer,
         )
 

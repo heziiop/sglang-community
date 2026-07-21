@@ -136,8 +136,6 @@ def prepare_decode_context_parallel_metadata(
 
 def prepare_npu_dcp_extend_metadata(
     extend_prefix_lens_cpu: list[int],
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
     kv_cache_dim: int,
     kv_cache_dtype: torch.dtype,
     kv_cache_device: torch.device,
@@ -146,27 +144,7 @@ def prepare_npu_dcp_extend_metadata(
     if not dcp_enabled():
         return None
 
-    extend_prefix_lens_cpu = [int(length) for length in extend_prefix_lens_cpu]
-    prefix_lens = torch.as_tensor(
-        extend_prefix_lens_cpu, dtype=torch.long, device=req_to_token.device
-    )
-    total_prefix_len = sum(extend_prefix_lens_cpu)
-    max_prefix_len = max(extend_prefix_lens_cpu, default=0)
-
-    if max_prefix_len == 0:
-        prefix_kv_indices = req_to_token.new_empty(0)
-    else:
-        positions = torch.arange(max_prefix_len, device=req_to_token.device)
-        prefix_mask = positions.unsqueeze(0) < prefix_lens.unsqueeze(1)
-        prefix_kv_indices = req_to_token[
-            req_pool_indices, :max_prefix_len
-        ][prefix_mask]
-
-    dcp_world_size = get_dcp_world_size()
-    dcp_rank = get_dcp_rank()
-    local_prefix_kv_indices = prefix_kv_indices[
-        prefix_kv_indices % dcp_world_size == dcp_rank
-    ] // dcp_world_size
+    total_prefix_len = sum(int(length) for length in extend_prefix_lens_cpu)
 
     return DecodeContextParallelMetadata(
         dcp_kv_buffer=torch.empty(
@@ -174,7 +152,6 @@ def prepare_npu_dcp_extend_metadata(
             dtype=kv_cache_dtype,
             device=kv_cache_device,
         ),
-        dcp_local_prefix_kv_indices=local_prefix_kv_indices,
     )
 
 
@@ -232,22 +209,22 @@ def plan_dcp_decode_metadata(
     kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
 
 
-def plan_dcp_decode_metadata_npu(
-    seq_lens_cpu: torch.Tensor,
+def plan_dcp_kv_metadata_npu(
+    kv_lens_cpu: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
     page_size: int,
     dcp_world_size: int,
     dcp_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build per-rank sequence lengths and FIA block tables for NPU decode."""
-    dcp_seq_lens = seq_lens_cpu // dcp_world_size + (
-        dcp_rank < seq_lens_cpu % dcp_world_size
+    """Build NPU DCP metadata for KV ranges starting at sequence position 0."""
+    dcp_kv_lens = kv_lens_cpu // dcp_world_size + (
+        dcp_rank < kv_lens_cpu % dcp_world_size
     )
     dcp_page_size = page_size * dcp_world_size
-    max_len = int(seq_lens_cpu.max().item())
+    max_len = int(kv_lens_cpu.max().item())
     block_tables = (
         req_to_token[req_pool_indices, : max_len : dcp_page_size]
         // dcp_page_size
     ).to(torch.int32)
-    return dcp_seq_lens.int(), block_tables
+    return dcp_kv_lens.int(), block_tables

@@ -27,7 +27,7 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
-from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata_npu
+from sglang.srt.layers.dcp.planner import plan_dcp_kv_metadata_npu
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -88,6 +88,8 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    dcp_local_prefix_lens_cpu_int: Optional[torch.Tensor] = None
+    dcp_prefix_block_tables: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -495,8 +497,8 @@ class AscendAttnBackend(AttentionBackend):
             (
                 self.forward_metadata.dcp_seq_lens_cpu_int,
                 self.forward_metadata.dcp_block_tables,
-            ) = plan_dcp_decode_metadata_npu(
-                seq_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+            ) = plan_dcp_kv_metadata_npu(
+                kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
                 req_pool_indices=forward_batch.req_pool_indices,
                 req_to_token=self.req_to_token_pool.req_to_token,
                 page_size=self.page_size,
@@ -514,22 +516,30 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
                 "cpu"
             )
-            seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
-            self.forward_metadata.flatten_prefix_block_tables = torch.empty(
-                0, dtype=torch.int32
-            ).to(self.device)
-            for req_idx, seq_len in zip(
-                forward_batch.req_pool_indices.tolist(), seq_prefix_lens
-            ):
-                req_indices = self.req_to_token_pool.req_to_token[req_idx]
-                req_prefix_block_tables = (
-                    req_indices[:seq_len][:: self.page_size] // self.page_size
+            if dcp_enabled():
+                (
+                    self.forward_metadata.dcp_local_prefix_lens_cpu_int,
+                    self.forward_metadata.dcp_prefix_block_tables,
+                ) = plan_dcp_kv_metadata_npu(
+                    kv_lens_cpu=self.forward_metadata.prefix_lens,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                    page_size=self.page_size,
+                    dcp_world_size=get_attention_dcp_world_size(),
+                    dcp_rank=get_attention_dcp_rank(),
                 )
+            else:
+                seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
                 self.forward_metadata.flatten_prefix_block_tables = torch.cat(
-                    (
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        torch.flatten(req_prefix_block_tables),
-                    )
+                    [
+                        self.req_to_token_pool.req_to_token[req_idx, :seq_len][
+                            :: self.page_size
+                        ]
+                        // self.page_size
+                        for req_idx, seq_len in zip(
+                            forward_batch.req_pool_indices.tolist(), seq_prefix_lens
+                        )
+                    ]
                 )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -741,8 +751,8 @@ class AscendAttnBackend(AttentionBackend):
             (
                 metadata.dcp_seq_lens_cpu_int,
                 dcp_block_tables,
-            ) = plan_dcp_decode_metadata_npu(
-                seq_lens_cpu=planning_seq_lens_cpu,
+            ) = plan_dcp_kv_metadata_npu(
+                kv_lens_cpu=planning_seq_lens_cpu,
                 req_pool_indices=req_pool_indices[:bs],
                 req_to_token=self.req_to_token,
                 page_size=self.page_size,
