@@ -2517,7 +2517,8 @@ class AscendAttnBackend(AttentionBackend):
 
             # DCP decode requires LSE for online softmax merge across ranks.
             if dcp_enabled():
-                lse_squeezed = softmax_lse.squeeze(-1).squeeze(-1)
+                # FIA LSE is [B, H, 1, 1] (head dim at pos 1); slice back.
+                lse_squeezed = softmax_lse[:, : layer.tp_q_head_num].squeeze(-1).squeeze(-1)
                 if lse_squeezed.ndim == 3:
                     lse_squeezed = lse_squeezed.squeeze(1)
                 return attn_output, lse_squeezed

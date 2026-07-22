@@ -72,7 +72,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
+from sglang.srt.layers.dcp.planner import prepare_npu_dcp_extend_metadata
+from sglang.srt.models.deepseek_common.utils import _is_cuda, _is_npu, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -968,6 +969,32 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        if _is_npu:
+            return prepare_npu_dcp_extend_metadata(
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                kv_cache_dim=(
+                    self.config.kv_lora_rank + self.config.qk_rope_head_dim
+                ),
+                kv_cache_dtype=kv_cache_dtype,
+                kv_cache_device=kv_cache_device,
+            )
+
+        return None
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
