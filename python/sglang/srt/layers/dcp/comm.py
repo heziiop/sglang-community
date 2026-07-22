@@ -18,6 +18,10 @@ The two LSE-merge variants kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
+
+For NPU, ``cp_lse_ag_out_rs_mla_npu`` replaces the separate all-gather(LSE)
++ PyTorch correction + reduce-scatter with a single all-to-all packed exchange
++ the fused ``torch_npu.npu_attention_update`` kernel (vllm-ascend approach).
 """
 
 from typing import Optional
@@ -130,6 +134,65 @@ def cp_lse_ag_out_rs_mla(
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)
+
+
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge DCP partial attention outputs via all-to-all + fused NPU kernel.
+
+    Replaces the two-collective sequence (all-gather LSE + reduce-scatter output)
+    with a single all-to-all that exchanges packed [output, LSE] tensors, followed
+    by ``torch_npu.npu_attention_update`` for the fused log-sum-exp correction and
+    weighted sum.  Adapted from vllm-ascend's ``_process_attn_out_lse`` +
+    ``_npu_attention_update`` pattern.
+
+    Args:
+        cp_attn_out:  Partial attention output  [B, H_total, D]
+        cp_attn_lse:  Per-rank LSE              [B, H_total]
+        cp_group:     DCP subgroup coordinator
+
+    Returns:
+        Merged attention output  [B, H_local, D]  (original dtype)
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    B, H_total, D = cp_attn_out.shape
+    n_ranks = cp_group.world_size
+    H_local = H_total // n_ranks
+
+    # Cast to fp32 for numerical stability (same as vllm-ascend and Triton/PyTorch path).
+    # Use local variables to avoid overwriting cp_attn_out.dtype needed for the final cast.
+    attn_fp32 = cp_attn_out.to(torch.float32)
+    lse_fp32 = cp_attn_lse.to(torch.float32)
+
+    # 1. Pack output + LSE:  [B, H_total, D] + [B, H_total, 1] → [B, H_total, D+1]
+    attn_out_lse = torch.cat([attn_fp32, lse_fp32.unsqueeze(-1)], dim=-1)
+
+    # 2. Permute → [H_total, D+1, B], all-to-all on head dim, permute back
+    attn_out_lse = attn_out_lse.permute(1, 2, 0).contiguous()
+    attn_all2all = torch.empty_like(attn_out_lse)
+    cp_group.all_to_all_single(attn_all2all, attn_out_lse)
+    attn_out_lse = attn_all2all.permute(2, 0, 1)
+
+    # 3. Group by origin rank: [B, N, H_local, D+1] → [N, B*H_local, D+1]
+    x = attn_out_lse.view(B, n_ranks, H_local, D + 1)
+    x = x.permute(1, 0, 2, 3).contiguous().view(n_ranks, B * H_local, D + 1)
+
+    out_flat, lse_flat = torch.split(x, [D, 1], dim=-1)
+    out_list = out_flat.unbind(0)                     # N × [B*H_local, D]
+    lse_list = lse_flat.squeeze(-1).unbind(0)          # N × [B*H_local]
+
+    # 4. Fused NPU kernel: logsumexp merge + weighted sum in one call
+    merged, _ = torch_npu.npu_attention_update(lse_list, out_list, 0)  # [B*H_local, D]
+
+    # 5. Restore shape [B, H_local, D]
+    return merged.view(B, H_local, D).to(cp_attn_out.dtype)
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):

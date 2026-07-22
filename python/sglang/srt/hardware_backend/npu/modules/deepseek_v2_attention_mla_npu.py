@@ -20,7 +20,7 @@ from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_dcp,
     all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs_mla,
+    cp_lse_ag_out_rs_mla_npu,
     dcp_enabled,
     get_attention_dcp_world_size,
 )
@@ -383,8 +383,7 @@ def forward_mla_core_npu(
             m.num_local_heads * get_attention_dcp_world_size(),
             m.kv_lora_rank,
         )
-        attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
-        attn_output = attn_output.transpose(0, 1)
+        attn_output = cp_lse_ag_out_rs_mla_npu(attn_output, lse, get_dcp_group())
     else:
         attn_output = m.attn_mqa(
             q_nope_out,
