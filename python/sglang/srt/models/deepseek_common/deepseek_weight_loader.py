@@ -60,6 +60,7 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
@@ -685,6 +686,13 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+            # Decode only runs the matrix-absorbed MLA path, which never reads
+            # kv_b_proj, so its weight is dead and can be freed.
+            if get_disagg().disaggregation_mode == "decode" and not hasattr(
+                self_attn.kv_b_proj, "qweight"
+            ):
+                self_attn.kv_b_proj.weight.data.untyped_storage().resize_(0)
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
