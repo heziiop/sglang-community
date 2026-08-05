@@ -65,11 +65,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if server_args.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
-                )
+                pass
             from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:
