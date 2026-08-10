@@ -16,13 +16,118 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _should_use_mha_chunked_kv_npu(
+    m: "DeepseekV2AttentionMLA", forward_batch: "ForwardBatch"
+) -> bool:
+    if forward_batch.num_prefix_chunks is not None:
+        return True
+
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if not (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and prefix_lens is not None
+        and any(prefix_lens)
+        and not m.disable_chunked_prefix_cache
+    ):
+        return False
+
+    page_size = get_attn_backend().page_size
+    max_chunk_len = forward_batch.get_max_chunk_capacity() // forward_batch.batch_size
+    max_chunk_len -= max_chunk_len % page_size
+    return max(prefix_lens) > max_chunk_len
+
+
+def _forward_mha_chunked_kv_npu(
+    m: "DeepseekV2AttentionMLA",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> torch.Tensor:
+    if forward_batch.num_prefix_chunks is None:
+        forward_batch.prepare_chunked_prefix_cache_info(
+            q.device,
+            prepare_kv_indices=False,
+            chunk_alignment=get_attn_backend().page_size,
+        )
+
+    num_token_padding = q.shape[0]
+    num_tokens = forward_batch.num_token_non_padded_cpu
+    q, k, v = [tensor[:num_tokens] for tensor in (q, k, v)]
+    forward_batch.mha_return_lse = True
+    forward_batch.set_attn_attend_prefix_cache(False)
+    attn_output, attn_lse = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+    output_dtype = attn_output.dtype
+    out_list = [attn_output.reshape(-1, m.v_head_dim).float()]
+    lse_list = [attn_lse.squeeze(-1).reshape(-1).float()]
+
+    assert forward_batch.num_prefix_chunks is not None
+    assert forward_batch.prefix_chunk_seq_lens_cpu is not None
+    assert forward_batch.prefix_chunk_starts_cpu is not None
+    assert forward_batch.prefix_chunk_num_tokens is not None
+    token_to_kv_pool = get_token_to_kv_pool()
+    k_buffer = token_to_kv_pool.get_key_buffer(m.attn_mqa.layer_id)
+    v_buffer = token_to_kv_pool.get_value_buffer(m.attn_mqa.layer_id)
+    prefix_block_tables = get_attn_backend().forward_metadata.prefix_block_tables
+    forward_batch.set_attn_attend_prefix_cache(True)
+    for chunk_idx in range(forward_batch.num_prefix_chunks):
+        forward_batch.set_prefix_chunk_idx(chunk_idx)
+        chunk_lens = forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx].to(
+            device=k_buffer.device, dtype=torch.int32
+        )
+        chunk_starts = forward_batch.prefix_chunk_starts_cpu[chunk_idx].to(
+            device=k_buffer.device, dtype=torch.int32
+        )
+        num_chunk_tokens = int(forward_batch.prefix_chunk_num_tokens[chunk_idx])
+        kv_a = k_buffer.new_empty(num_chunk_tokens, *k_buffer.shape[2:])
+        k_pe = v_buffer.new_empty(num_chunk_tokens, *v_buffer.shape[2:])
+        if num_chunk_tokens > 0:
+            torch_npu.npu_gather_pa_kv_cache(
+                k_buffer,
+                v_buffer,
+                prefix_block_tables,
+                chunk_lens.contiguous(),
+                seq_offset=chunk_starts.contiguous(),
+                key=kv_a,
+                value=k_pe,
+            )
+
+        k_nope, chunk_v = (
+            m.kv_b_proj(kv_a.contiguous())[0]
+            .view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
+            .split([m.qk_nope_head_dim, m.v_head_dim], dim=-1)
+        )
+        chunk_k = m._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        chunk_output, chunk_lse = m.attn_mha(
+            q, chunk_k, chunk_v, forward_batch, save_kv_cache=False
+        )
+        out_list.append(chunk_output.reshape(-1, m.v_head_dim).float())
+        lse_list.append(chunk_lse.squeeze(-1).reshape(-1).float())
+
+    attn_output, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
+    attn_output = attn_output.view(num_tokens, m.num_local_heads, m.v_head_dim).to(
+        output_dtype
+    )
+    if num_token_padding != num_tokens:
+        padding = attn_output.new_zeros(
+            num_token_padding - num_tokens, *attn_output.shape[1:]
+        )
+        attn_output = torch.cat([attn_output, padding], dim=0)
+    attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+    output, _ = m.o_proj(attn_output)
+    return output
 
 
 # region MHA
@@ -136,6 +241,9 @@ def forward_mha_core_npu(
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
+    if _should_use_mha_chunked_kv_npu(m, forward_batch):
+        return _forward_mha_chunked_kv_npu(m, q, k, v, forward_batch)
+
     attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_output)

@@ -93,6 +93,7 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    prefix_block_tables: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -469,7 +470,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
 
-        self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        self.forward_metadata.seq_lens_cpu_int = (
+            forward_batch.seq_lens_cpu.int().clone()
+        )
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -521,6 +524,14 @@ class AscendAttnBackend(AttentionBackend):
         ):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
                 "cpu"
+            )
+            max_prefix_len = int(self.forward_metadata.prefix_lens.max().item())
+            self.forward_metadata.prefix_block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices,
+                    : max_prefix_len : self.page_size,
+                ]
+                // self.page_size
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
             self.forward_metadata.flatten_prefix_block_tables = torch.empty(
@@ -1593,6 +1604,61 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif (
+            sum(forward_batch.extend_prefix_lens_cpu) > 0
+            and forward_batch.mha_return_lse
+        ):
+            # Compute one extend/prefix segment and let the caller merge by LSE.
+            assert forward_batch.attn_attend_prefix_cache is not None
+            attend_prefix = forward_batch.attn_attend_prefix_cache
+            num_tokens = forward_batch.num_token_non_padded_cpu
+            q = q[:num_tokens]
+            if not attend_prefix:
+                k, v = k[:num_tokens], v[:num_tokens]
+
+            if layer.qk_head_dim == layer.v_head_dim:
+                q_nope, q_rope = q, None
+                k_nope, k_rope = k, None
+            else:
+                q_nope, q_rope = q.split(
+                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+                k_nope, k_rope = k.split(
+                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+
+            # Q always contains the extend tokens. K/V contains either the current
+            # prefix chunk or the extend tokens themselves.
+            actual_seq_lengths = np.cumsum(
+                self.forward_metadata.extend_seq_lens_cpu_int
+            ).tolist()
+            if attend_prefix:
+                actual_seq_lengths_kv = np.cumsum(
+                    forward_batch.prefix_chunk_seq_lens_cpu[
+                        forward_batch.prefix_chunk_idx
+                    ]
+                ).tolist()
+            else:
+                actual_seq_lengths_kv = actual_seq_lengths
+            attn_output, attn_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope.contiguous(),
+                v.contiguous(),
+                query_rope=q_rope,
+                key_rope=(k_rope.contiguous() if k_rope is not None else None),
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                atten_mask=None if attend_prefix else self.fia_mask,
+                sparse_mode=0 if attend_prefix else 3,
+                scale=layer.scaling,
+                next_tokens=0,
+                actual_seq_lengths=actual_seq_lengths,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                softmax_lse_flag=True,
+            )
+            return attn_output, attn_lse
+
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,

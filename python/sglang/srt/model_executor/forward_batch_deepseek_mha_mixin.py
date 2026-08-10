@@ -116,7 +116,13 @@ class ForwardBatchDeepSeekMHAMixin:
 
     # Called before each attention module if using chunked kv cache for prefill
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-    def prepare_chunked_prefix_cache_info(self, device: torch.device):
+    def prepare_chunked_prefix_cache_info(
+        self,
+        device: torch.device,
+        *,
+        prepare_kv_indices: bool = True,
+        chunk_alignment: int = 1,
+    ):
 
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
@@ -142,6 +148,16 @@ class ForwardBatchDeepSeekMHAMixin:
         # chunk_capacity is the maximum number of tokens in each chunk
         chunk_capacity = self.get_max_chunk_capacity()
         self.prefix_chunk_len = chunk_capacity // self.batch_size
+        if chunk_alignment <= 0:
+            raise ValueError(f"chunk_alignment must be positive, got {chunk_alignment}")
+        self.prefix_chunk_len = (
+            self.prefix_chunk_len // chunk_alignment
+        ) * chunk_alignment
+        if self.prefix_chunk_len == 0:
+            raise ValueError(
+                f"chunk capacity {chunk_capacity} cannot fit one aligned chunk "
+                f"for batch size {self.batch_size} with alignment {chunk_alignment}"
+            )
 
         self.num_prefix_chunks = (
             max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
@@ -192,8 +208,9 @@ class ForwardBatchDeepSeekMHAMixin:
             for i in range(self.num_prefix_chunks)
         ]
 
-        # Precompute the kv indices for each chunk
-        self.prepare_chunked_kv_indices(device)
+        if prepare_kv_indices:
+            # Precompute the kv indices for each chunk
+            self.prepare_chunked_kv_indices(device)
 
     def fetch_mha_one_shot_kv_indices(self):
         if self.mha_one_shot_kv_indices is not None:
