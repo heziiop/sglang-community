@@ -35,3 +35,13 @@ class DecodeContextParallelMetadata:
     dcp_kv_indices: Optional[torch.Tensor] = None
     dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
     dcp_extend_prefix_lens_sum: Optional[int] = None
+
+
+@dataclass
+class NPUMLAPrefixDCPMetadata:
+    """NPU DCP layout for MLA cached-prefix segments."""
+
+    prefix_segment_local_starts: torch.Tensor
+    prefix_segment_local_lens: torch.Tensor
+    prefix_segment_local_token_counts: list[int]
+    prefix_segment_restore_indices: list[torch.Tensor]

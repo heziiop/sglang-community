@@ -61,7 +61,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+    from sglang.srt.layers.dcp.metadata import (
+        DecodeContextParallelMetadata,
+        NPUMLAPrefixDCPMetadata,
+    )
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -93,6 +96,22 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def _maybe_localize_npu_dcp_out_cache_loc(
+    out_cache_loc: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return the rank-local NPU DCP write view without mutating scheduler state."""
+    parallel = get_parallel()
+    if not _is_npu or not parallel.dcp_enabled or out_cache_loc is None:
+        return out_cache_loc
+
+    is_local = out_cache_loc % parallel.dcp_size == parallel.dcp_rank
+    return torch.where(
+        is_local,
+        out_cache_loc // parallel.dcp_size,
+        torch.full_like(out_cache_loc, -1),
+    )
 
 
 class ForwardMode(IntEnum):
@@ -598,7 +617,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
     # import block above) — available for annotations but NOT bound at runtime in this
     # module. Import it from sglang.srt.layers.dcp.metadata if a runtime use is added.
-    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
+    attn_dcp_metadata: Optional[
+        Union[DecodeContextParallelMetadata, NPUMLAPrefixDCPMetadata]
+    ] = None
 
     # Decode context parallel KV write mask.
     dcp_kv_mask: Optional[torch.Tensor] = None
@@ -838,6 +859,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
         )
+
+        # ScheduleBatch and req_to_token keep allocator-global slot identities.
+        # Only the runtime ForwardBatch exposes rank-local NPU DCP write slots.
+        ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(ret.out_cache_loc)
 
         ret._maybe_init_non_generation_fields(batch)
 
