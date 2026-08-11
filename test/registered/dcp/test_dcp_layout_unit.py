@@ -22,7 +22,8 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
+from sglang.srt.layers.dcp.planner import plan_npu_dcp_prefix_segments
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -48,6 +49,48 @@ def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
 
 
 class TestGetDcpLens(CustomTestCase):
+    def test_chain_spec_lens_are_request_major(self):
+        total_kv_lens = torch.tensor([5, 8], dtype=torch.int32)
+
+        rank0 = get_dcp_chain_spec_lens(total_kv_lens, 3, 2, 0)
+        rank1 = get_dcp_chain_spec_lens(total_kv_lens, 3, 2, 1)
+
+        self.assertEqual(rank0.tolist(), [2, 2, 3, 3, 4, 4])
+        self.assertEqual(rank1.tolist(), [1, 2, 2, 3, 3, 4])
+
+    def test_chain_spec_padding_request_has_zero_lens(self):
+        got = get_dcp_chain_spec_lens(torch.tensor([2, 4], dtype=torch.int32), 3, 2, 0)
+        self.assertEqual(got.tolist(), [0, 0, 0, 1, 2, 2])
+
+    def test_npu_prefix_segments_build_local_layout_and_restore_order(self):
+        metadata = plan_npu_dcp_prefix_segments(
+            torch.tensor([[0, 0], [8, 8]], dtype=torch.int32),
+            torch.tensor([[8, 16], [8, 8]], dtype=torch.int32),
+            dcp_world_size=2,
+            page_size=4,
+            kv_cache_device=torch.device("cpu"),
+        )
+
+        self.assertEqual(
+            metadata.prefix_segment_local_starts.tolist(), [[0, 0], [4, 4]]
+        )
+        self.assertEqual(metadata.prefix_segment_local_lens.tolist(), [[4, 8], [4, 4]])
+        self.assertEqual(metadata.prefix_segment_local_token_counts, [12, 8])
+        self.assertEqual(
+            metadata.prefix_segment_restore_indices[1].tolist(),
+            [value for offset in range(8) for value in (offset, offset + 8)],
+        )
+
+    def test_npu_prefix_segments_reject_unaligned_ranges(self):
+        with self.assertRaisesRegex(ValueError, r"page_size \* dcp_world_size"):
+            plan_npu_dcp_prefix_segments(
+                torch.tensor([[4]], dtype=torch.int32),
+                torch.tensor([[8]], dtype=torch.int32),
+                dcp_world_size=2,
+                page_size=4,
+                kv_cache_device=torch.device("cpu"),
+            )
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):

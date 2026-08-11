@@ -23,6 +23,8 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
+from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -89,11 +91,16 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+            parallel = get_parallel()
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (
                     forward_batch.seq_lens_cpu[: self.raw_bs] + speculative_step_id + 1
                 )
+                if parallel.dcp_enabled:
+                    seq_lens_cpu = get_dcp_lens(
+                        seq_lens_cpu, parallel.dcp_size, parallel.dcp_rank
+                    )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
             attr_name = self._get_update_attr_name()

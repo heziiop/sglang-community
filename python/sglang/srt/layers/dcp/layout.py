@@ -41,6 +41,42 @@ def get_dcp_lens(
     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
 
 
+def get_dcp_chain_spec_lens(
+    total_kv_lens: torch.Tensor,
+    tokens_per_req: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Return request-major local KV frontiers for a topk=1 spec chain.
+
+    For a request whose final KV length is ``L`` and chain width is ``T``, the
+    queries attend to global prefixes ``L-T+1, ..., L``. Rows with ``L < T``
+    are graph-padding requests and produce all-zero lengths.
+    """
+    if tokens_per_req < 1:
+        raise ValueError(f"tokens_per_req must be >= 1, got {tokens_per_req}")
+
+    # total_kv_lens: [batch_size], steps: [tokens_per_req].
+    total_kv_lens = total_kv_lens.int()
+    steps = torch.arange(
+        1,
+        tokens_per_req + 1,
+        dtype=total_kv_lens.dtype,
+        device=total_kv_lens.device,
+    )
+    # [batch_size, 1] broadcasts with [tokens_per_req] to produce
+    # [batch_size, tokens_per_req], one visible KV frontier per draft query.
+    global_query_lens = total_kv_lens.unsqueeze(1) - tokens_per_req + steps
+    global_query_lens = torch.where(
+        total_kv_lens.unsqueeze(1) >= tokens_per_req,
+        global_query_lens,
+        torch.zeros_like(global_query_lens),
+    )
+    # Flatten to [batch_size * tokens_per_req] in request-major order:
+    # req0/q0..qT-1, req1/q0..qT-1, ...
+    return get_dcp_lens(global_query_lens.reshape(-1), dcp_size, dcp_rank).int()
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     parallel = get_parallel()
     if parallel.dcp_enabled:

@@ -25,7 +25,10 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     update_kv_lens_and_indices,
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
-from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.metadata import (
+    DecodeContextParallelMetadata,
+    NPUMLAPrefixDCPMetadata,
+)
 from sglang.srt.runtime_context import get_device, get_parallel
 
 
@@ -131,6 +134,67 @@ def prepare_decode_context_parallel_metadata(
         dcp_extend_prefix_lens_sum=extend_prefix_lens_sum,
     )
     return attn_dcp_metadata
+
+
+def plan_npu_dcp_prefix_segments(
+    prefix_segment_starts_cpu: torch.Tensor,
+    prefix_segment_seq_lens_cpu: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    page_size: int,
+    kv_cache_device: torch.device,
+) -> NPUMLAPrefixDCPMetadata:
+    """Build the rank-local layout for NPU MLA prefix segments."""
+    if dcp_world_size < 1:
+        raise ValueError(f"dcp_world_size must be positive, got {dcp_world_size}")
+    if page_size < 1:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if prefix_segment_starts_cpu.shape != prefix_segment_seq_lens_cpu.shape:
+        raise ValueError("segment starts and lengths must have the same shape")
+    if prefix_segment_starts_cpu.dim() != 2:
+        raise ValueError("segment starts and lengths must be [num_segments, batch]")
+
+    starts = prefix_segment_starts_cpu.to(dtype=torch.int64, device="cpu")
+    lens = prefix_segment_seq_lens_cpu.to(dtype=torch.int64, device="cpu")
+    if bool((starts < 0).any()) or bool((lens < 0).any()):
+        raise ValueError("segment starts and lengths must be non-negative")
+    segment_alignment = page_size * dcp_world_size
+    if bool((starts % segment_alignment != 0).any()) or bool(
+        (lens % segment_alignment != 0).any()
+    ):
+        raise ValueError(
+            "NPU DCP prefix segment starts and lengths must align to "
+            "page_size * dcp_world_size"
+        )
+
+    num_segments = starts.shape[0]
+    # DCP prefix matching and segment planning both align to page_size *
+    # dcp_world_size, so every rank owns the same number of tokens.
+    local_starts = starts // dcp_world_size
+    local_lens = lens // dcp_world_size
+
+    local_counts = []
+    restore_indices = []
+    for segment_idx in range(num_segments):
+        local_count = int(local_lens[segment_idx].sum().item())
+        local_counts.append(local_count)
+
+        global_offsets = torch.arange(
+            local_count * dcp_world_size,
+            dtype=torch.int64,
+            device=kv_cache_device,
+        )
+        restore_indices.append(
+            global_offsets % dcp_world_size * local_count
+            + global_offsets // dcp_world_size
+        )
+
+    return NPUMLAPrefixDCPMetadata(
+        prefix_segment_local_starts=local_starts.to(kv_cache_device, dtype=torch.int32),
+        prefix_segment_local_lens=local_lens.to(kv_cache_device, dtype=torch.int32),
+        prefix_segment_local_token_counts=local_counts,
+        prefix_segment_restore_indices=restore_indices,
+    )
 
 
 def plan_dcp_decode_metadata(

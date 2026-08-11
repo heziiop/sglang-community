@@ -16,16 +16,33 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.dcp.comm import (
+    all_gather_packed_kv_cache_for_dcp,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla_npu,
+)
+from sglang.srt.layers.dcp.metadata import NPUMLAPrefixDCPMetadata
+from sglang.srt.layers.dcp.planner import plan_npu_dcp_prefix_segments
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
+
+
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _use_dcp_mla_partial_attention(forward_batch: "ForwardBatch") -> bool:
+    mode = forward_batch.forward_mode
+    return get_parallel().dcp_enabled and (
+        mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2()
+    )
 
 
 def _should_use_mha_chunked_kv_npu(
@@ -44,25 +61,116 @@ def _should_use_mha_chunked_kv_npu(
         return False
 
     page_size = get_attn_backend().page_size
+    if get_parallel().dcp_enabled:
+        page_size *= get_parallel().attn_dcp_size
     max_chunk_len = forward_batch.get_max_chunk_capacity() // forward_batch.batch_size
     max_chunk_len -= max_chunk_len % page_size
     return max(prefix_lens) > max_chunk_len
 
 
-def _forward_mha_chunked_kv_npu(
+def _prepare_mha_prefix_segments_npu(
+    m: "DeepseekV2AttentionMLA",
+    q: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> None:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if not (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and prefix_lens is not None
+        and any(prefix_lens)
+    ):
+        return
+
+    backend = get_attn_backend()
+    parallel = get_parallel()
+    dcp_world_size = parallel.attn_dcp_size
+    use_chunked_prefix = _should_use_mha_chunked_kv_npu(m, forward_batch)
+    if use_chunked_prefix and forward_batch.num_prefix_chunks is None:
+        forward_batch.prepare_chunked_prefix_cache_info(
+            q.device,
+            prepare_kv_indices=False,
+            chunk_alignment=backend.page_size * dcp_world_size,
+        )
+
+    if not parallel.dcp_enabled or forward_batch.attn_dcp_metadata is not None:
+        return
+
+    if use_chunked_prefix:
+        prefix_segment_starts = forward_batch.prefix_chunk_starts_cpu
+        prefix_segment_lens = forward_batch.prefix_chunk_seq_lens_cpu
+        assert prefix_segment_starts is not None
+        assert prefix_segment_lens is not None
+    else:
+        prefix_segment_lens = torch.tensor(prefix_lens, dtype=torch.int32).unsqueeze(0)
+        prefix_segment_starts = torch.zeros_like(prefix_segment_lens)
+
+    forward_batch.attn_dcp_metadata = plan_npu_dcp_prefix_segments(
+        prefix_segment_starts,
+        prefix_segment_lens,
+        dcp_world_size=dcp_world_size,
+        page_size=backend.page_size,
+        kv_cache_device=q.device,
+    )
+
+
+def _load_mha_prefix_segment_npu(
+    m: "DeepseekV2AttentionMLA",
+    forward_batch: "ForwardBatch",
+    dcp_metadata: NPUMLAPrefixDCPMetadata | None,
+    segment_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    token_to_kv_pool = get_token_to_kv_pool()
+    k_buffer = token_to_kv_pool.get_key_buffer(m.attn_mqa.layer_id)
+    v_buffer = token_to_kv_pool.get_value_buffer(m.attn_mqa.layer_id)
+    if dcp_metadata is None:
+        assert forward_batch.prefix_chunk_seq_lens_cpu is not None
+        assert forward_batch.prefix_chunk_starts_cpu is not None
+        assert forward_batch.prefix_chunk_num_tokens is not None
+        segment_lens = forward_batch.prefix_chunk_seq_lens_cpu[segment_idx].to(
+            device=k_buffer.device, dtype=torch.int32
+        )
+        segment_starts = forward_batch.prefix_chunk_starts_cpu[segment_idx].to(
+            device=k_buffer.device, dtype=torch.int32
+        )
+        local_token_count = int(forward_batch.prefix_chunk_num_tokens[segment_idx])
+    else:
+        segment_lens = dcp_metadata.prefix_segment_local_lens[segment_idx]
+        segment_starts = dcp_metadata.prefix_segment_local_starts[segment_idx]
+        local_token_count = dcp_metadata.prefix_segment_local_token_counts[segment_idx]
+
+    local_kv = k_buffer.new_empty(local_token_count, *k_buffer.shape[2:])
+    local_k_pe = v_buffer.new_empty(local_token_count, *v_buffer.shape[2:])
+    if local_token_count > 0:
+        prefix_block_tables = get_attn_backend().forward_metadata.prefix_block_tables
+        assert prefix_block_tables is not None
+        torch_npu.npu_gather_pa_kv_cache(
+            k_buffer,
+            v_buffer,
+            prefix_block_tables,
+            segment_lens.contiguous(),
+            seq_offset=segment_starts.contiguous(),
+            key=local_kv,
+            value=local_k_pe,
+        )
+
+    if dcp_metadata is None:
+        return local_kv, local_k_pe
+
+    restored = all_gather_packed_kv_cache_for_dcp(
+        local_kv,
+        dcp_metadata.prefix_segment_restore_indices[segment_idx],
+        local_k_pe=local_k_pe,
+    )
+    return restored.split([local_kv.shape[-1], local_k_pe.shape[-1]], dim=-1)
+
+
+def _forward_mha_prefix_segments_npu(
     m: "DeepseekV2AttentionMLA",
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
-    if forward_batch.num_prefix_chunks is None:
-        forward_batch.prepare_chunked_prefix_cache_info(
-            q.device,
-            prepare_kv_indices=False,
-            chunk_alignment=get_attn_backend().page_size,
-        )
-
     num_token_padding = q.shape[0]
     num_tokens = forward_batch.num_token_non_padded_cpu
     q, k, v = [tensor[:num_tokens] for tensor in (q, k, v)]
@@ -73,37 +181,19 @@ def _forward_mha_chunked_kv_npu(
     out_list = [attn_output.reshape(-1, m.v_head_dim).float()]
     lse_list = [attn_lse.squeeze(-1).reshape(-1).float()]
 
-    assert forward_batch.num_prefix_chunks is not None
-    assert forward_batch.prefix_chunk_seq_lens_cpu is not None
-    assert forward_batch.prefix_chunk_starts_cpu is not None
-    assert forward_batch.prefix_chunk_num_tokens is not None
-    token_to_kv_pool = get_token_to_kv_pool()
-    k_buffer = token_to_kv_pool.get_key_buffer(m.attn_mqa.layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(m.attn_mqa.layer_id)
-    prefix_block_tables = get_attn_backend().forward_metadata.prefix_block_tables
-    forward_batch.set_attn_attend_prefix_cache(True)
-    for chunk_idx in range(forward_batch.num_prefix_chunks):
-        forward_batch.set_prefix_chunk_idx(chunk_idx)
-        chunk_lens = forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx].to(
-            device=k_buffer.device, dtype=torch.int32
-        )
-        chunk_starts = forward_batch.prefix_chunk_starts_cpu[chunk_idx].to(
-            device=k_buffer.device, dtype=torch.int32
-        )
-        num_chunk_tokens = int(forward_batch.prefix_chunk_num_tokens[chunk_idx])
-        kv_a = k_buffer.new_empty(num_chunk_tokens, *k_buffer.shape[2:])
-        k_pe = v_buffer.new_empty(num_chunk_tokens, *v_buffer.shape[2:])
-        if num_chunk_tokens > 0:
-            torch_npu.npu_gather_pa_kv_cache(
-                k_buffer,
-                v_buffer,
-                prefix_block_tables,
-                chunk_lens.contiguous(),
-                seq_offset=chunk_starts.contiguous(),
-                key=kv_a,
-                value=k_pe,
-            )
+    dcp_metadata = forward_batch.attn_dcp_metadata
+    use_chunked_prefix = forward_batch.num_prefix_chunks is not None
+    if get_parallel().dcp_enabled:
+        assert dcp_metadata is not None
+    num_prefix_segments = forward_batch.num_prefix_chunks if use_chunked_prefix else 1
 
+    forward_batch.set_attn_attend_prefix_cache(True)
+    for segment_idx in range(num_prefix_segments):
+        if use_chunked_prefix:
+            forward_batch.set_prefix_chunk_idx(segment_idx)
+        kv_a, k_pe = _load_mha_prefix_segment_npu(
+            m, forward_batch, dcp_metadata, segment_idx
+        )
         k_nope, chunk_v = (
             m.kv_b_proj(kv_a.contiguous())[0]
             .view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
@@ -225,6 +315,8 @@ def forward_mha_prepare_npu(
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
+    _prepare_mha_prefix_segments_npu(m, q, forward_batch)
+
     kv = m.kv_b_proj(kv_a)[0]
     kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
     k_nope = kv[..., : m.qk_nope_head_dim]
@@ -241,8 +333,11 @@ def forward_mha_core_npu(
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
-    if _should_use_mha_chunked_kv_npu(m, forward_batch):
-        return _forward_mha_chunked_kv_npu(m, q, k, v, forward_batch)
+    use_dcp_prefix = (
+        get_parallel().dcp_enabled and forward_batch.attn_dcp_metadata is not None
+    )
+    if _should_use_mha_chunked_kv_npu(m, forward_batch) or use_dcp_prefix:
+        return _forward_mha_prefix_segments_npu(m, q, k, v, forward_batch)
 
     attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
@@ -370,6 +465,11 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+    # DCP decode/speculative attention: all-gather Q across DCP ranks so each
+    # local KV shard computes partial outputs for the complete TP head set.
+    if _use_dcp_mla_partial_attention(forward_batch):
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+
     return (
         q_pe,
         k_pe,
@@ -393,15 +493,34 @@ def forward_mla_core_npu(
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
-        q_nope_out,
-        k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-    )
+    if _use_dcp_mla_partial_attention(forward_batch):
+        attn_output, lse = m.attn_mqa_for_dcp_decode(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+        )
+        # Merge partial attention outputs across DCP ranks
+        attn_output = attn_output.view(
+            -1,
+            m.num_local_heads * get_parallel().attn_dcp_size,
+            m.kv_lora_rank,
+        )
+        attn_output = cp_lse_ag_out_rs_mla_npu(
+            attn_output, lse, get_parallel().dcp_group
+        )
+    else:
+        attn_output = m.attn_mqa(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 

@@ -149,6 +149,55 @@ def cp_lse_ag_out_rs_mla(
     return out.to(cp_attn_out.dtype)
 
 
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge NPU DCP partial outputs with one packed all-to-all.
+
+    ``cp_attn_out`` is ``[batch, total_heads, head_dim]`` and ``cp_attn_lse``
+    is ``[batch, total_heads]``. The result is
+    ``[batch, local_heads, head_dim]``.
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    batch_size, total_heads, head_dim = cp_attn_out.shape
+    world_size = cp_group.world_size
+    local_heads = total_heads // world_size
+
+    attn_fp32 = cp_attn_out.to(torch.float32)
+    lse_fp32 = cp_attn_lse.to(torch.float32)
+
+    # [batch, total_heads, head_dim + 1]
+    attn_out_lse = torch.cat([attn_fp32, lse_fp32.unsqueeze(-1)], dim=-1)
+
+    # Split total_heads across ranks during all-to-all.
+    attn_out_lse = attn_out_lse.permute(1, 2, 0).contiguous()
+    attn_all2all = torch.empty_like(attn_out_lse)
+    cp_group.all_to_all_single(attn_all2all, attn_out_lse)
+    attn_out_lse = attn_all2all.permute(2, 0, 1)
+
+    # [world_size, batch * local_heads, head_dim + 1]
+    attn_out_lse = attn_out_lse.view(batch_size, world_size, local_heads, head_dim + 1)
+    attn_out_lse = (
+        attn_out_lse.permute(1, 0, 2, 3)
+        .contiguous()
+        .view(world_size, batch_size * local_heads, head_dim + 1)
+    )
+
+    out_flat, lse_flat = torch.split(attn_out_lse, [head_dim, 1], dim=-1)
+    out_list = out_flat.unbind(0)
+    lse_list = lse_flat.squeeze(-1).unbind(0)
+
+    merged, _ = torch_npu.npu_attention_update(lse_list, out_list, 0)
+
+    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
+
+
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     parallel = get_parallel()
     dcp_world_size = parallel.dcp_size
@@ -170,6 +219,44 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
         .reshape(-1, *kv_a.shape[1:])
     )
     return gathered_kv_a
+
+
+def all_gather_packed_kv_cache_for_dcp(
+    local_kv: torch.Tensor,
+    restore_indices: torch.Tensor,
+    *,
+    local_k_pe: Optional[torch.Tensor] = None,
+    cp_group: Optional[GroupCoordinator] = None,
+) -> torch.Tensor:
+    """Pack, gather, and restore one DCP prefix segment."""
+    if cp_group is None:
+        cp_group = get_parallel().dcp_group
+
+    world_size = cp_group.world_size
+    if restore_indices.dim() != 1:
+        raise ValueError("restore_indices must be 1-D")
+    if local_k_pe is not None and local_k_pe.shape[:-1] != local_kv.shape[:-1]:
+        raise ValueError("local KV and RoPE shapes must match except for last dim")
+
+    local_token_count = local_kv.shape[0]
+    gathered_token_count = world_size * local_token_count
+    if restore_indices.shape[0] != gathered_token_count:
+        raise ValueError(
+            "restore_indices must contain one entry per global chunk token"
+        )
+    if local_k_pe is None:
+        packed = local_kv
+    else:
+        packed = torch.cat((local_kv, local_k_pe), dim=-1)
+
+    gathered = packed.new_empty(gathered_token_count, *packed.shape[1:])
+
+    if world_size == 1:
+        gathered.copy_(packed)
+    elif local_token_count > 0:
+        cp_group.all_gather_into_tensor(gathered, packed)
+
+    return torch.index_select(gathered, 0, restore_indices)
 
 
 def all_gather_kv_cache_for_mha_chunk_extend(
