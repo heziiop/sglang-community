@@ -87,6 +87,34 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     return kv_indices
 
 
+def remap_dcp_sparse_indices(
+    topk_indices: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> torch.Tensor:
+    """Map global sparse token indices to one rank's compact DCP KV layout.
+
+    The indexer orders entries by score. Sparse attention requires valid entries
+    before ``-1`` padding, so the rank-owned entries are stably compacted.
+    """
+    if dcp_size == 1:
+        return topk_indices
+
+    local_mask = (topk_indices >= 0) & (topk_indices % dcp_size == dcp_rank)
+    local_indices = torch.where(
+        local_mask,
+        topk_indices // dcp_size,
+        torch.full_like(topk_indices, -1),
+    )
+
+    # Build a stable permutation without sorting: every valid/invalid source gets
+    # its ordinal within that partition, and invalid entries follow all valids.
+    valid_dest = torch.cumsum(local_mask, dim=-1) - 1
+    invalid_dest = (
+        local_mask.sum(dim=-1, keepdim=True) + torch.cumsum(~local_mask, dim=-1) - 1
+    )
+    destination = torch.where(local_mask, valid_dest, invalid_dest).to(torch.int64)
+    return torch.empty_like(local_indices).scatter(-1, destination, local_indices)
+
+
 def update_local_kv_lens_for_dcp(kv_len_arr):
     """In-place per-rank KV length: the start=0 case of get_dcp_lens.
 

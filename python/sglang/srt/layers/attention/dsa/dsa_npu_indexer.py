@@ -3,6 +3,9 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
+    get_replicated_indexer_cache_loc,
+)
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -182,7 +185,7 @@ class DSANPUIndexerMixin:
             )
 
         get_token_to_kv_pool().set_index_k_buffer(
-            layer_id, forward_batch.out_cache_loc, k
+            layer_id, get_replicated_indexer_cache_loc(forward_batch, positions), k
         )
         if is_prefill:
             if (

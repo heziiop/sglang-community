@@ -45,6 +45,10 @@ def _use_dcp_mla_partial_attention(forward_batch: "ForwardBatch") -> bool:
     )
 
 
+def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
+    return get_parallel().dcp_enabled and not dsa_use_prefill_cp(forward_batch)
+
+
 def _should_use_mha_chunked_kv_npu(
     m: "DeepseekV2AttentionMLA", forward_batch: "ForwardBatch"
 ) -> bool:
@@ -665,6 +669,9 @@ def forward_dsa_prepare_npu(
     else:
         topk_indices = prev_topk_indices
 
+    if _use_dsa_dcp_partial_attention(forward_batch):
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+
     return (
         q_pe,
         k_pe,
@@ -688,16 +695,28 @@ def forward_dsa_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
+    use_dcp = _use_dsa_dcp_partial_attention(forward_batch)
+    attn = m.attn_mqa_for_dcp_decode if use_dcp else m.attn_mqa
+    attn_output = attn(
         q_nope_out.contiguous(),
         k_nope.contiguous(),
         k_nope.contiguous(),
         forward_batch,
-        save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
+        save_kv_cache=True,
         q_rope=q_pe.contiguous(),
         k_rope=k_pe.contiguous(),
         topk_indices=topk_indices,
     )
+    if use_dcp:
+        attn_output, lse = attn_output
+        attn_output = attn_output.view(
+            -1,
+            m.num_local_heads * get_parallel().attn_dcp_size,
+            m.kv_lora_rank,
+        )
+        attn_output = cp_lse_ag_out_rs_mla_npu(
+            attn_output, lse, get_parallel().dcp_group
+        )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_bmm_output = torch.empty(

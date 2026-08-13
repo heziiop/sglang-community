@@ -15,6 +15,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
+    forward_dcp_sparse_attention,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -93,9 +96,11 @@ class ForwardMetadata:
 
     # DCP decode inputs
     dcp_seq_lens_cpu_int: Optional[torch.Tensor] = None
+    dcp_seq_lens: Optional[torch.Tensor] = None
     dcp_block_tables: Optional[torch.Tensor] = None
     # DCP spec inputs: target verify / draft extend
     dcp_spec_seq_lens_cpu_int: Optional[torch.Tensor] = None
+    dcp_spec_seq_lens: Optional[torch.Tensor] = None
     dcp_spec_block_tables: Optional[torch.Tensor] = None
 
     # swa attention mask for graph mode decode
@@ -579,7 +584,7 @@ class AscendAttnBackend(AttentionBackend):
                     req_pool_indices=forward_batch.req_pool_indices,
                     is_spec=True,
                 )
-            elif forward_batch.forward_mode.is_decode_or_idle():
+            else:
                 (
                     self.forward_metadata.dcp_seq_lens_cpu_int,
                     self.forward_metadata.dcp_block_tables,
@@ -653,12 +658,20 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            self.graph_metadata["dcp_seq_lens"] = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            )
             if self.speculative_num_draft_tokens is not None:
                 self.graph_metadata["dcp_spec_block_tables"] = torch.zeros(
                     (
                         max_bs * self.speculative_num_draft_tokens,
                         max_dcp_seq_pages,
                     ),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.graph_metadata["dcp_spec_seq_lens"] = torch.zeros(
+                    max_bs * self.speculative_num_draft_tokens,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -711,6 +724,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if get_parallel().dcp_enabled and "dcp_block_tables" in self.graph_metadata:
             metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
+            metadata.dcp_seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
         if (
             get_parallel().dcp_enabled
             and "dcp_spec_block_tables" in self.graph_metadata
@@ -720,6 +734,9 @@ class AscendAttnBackend(AttentionBackend):
             metadata.dcp_spec_block_tables = self.graph_metadata[
                 "dcp_spec_block_tables"
             ][:num_spec_rows]
+            metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
+                :num_spec_rows
+            ]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
@@ -855,6 +872,11 @@ class AscendAttnBackend(AttentionBackend):
                     req_pool_indices=req_pool_indices[:bs],
                     is_spec=True,
                 )
+                metadata.dcp_spec_seq_lens.copy_(
+                    metadata.dcp_spec_seq_lens_cpu_int.to(
+                        device=metadata.dcp_spec_seq_lens.device
+                    )
+                )
                 dcp_pages = dcp_spec_block_tables.shape[1]
                 metadata.dcp_spec_block_tables[:, :dcp_pages].copy_(
                     dcp_spec_block_tables
@@ -867,6 +889,11 @@ class AscendAttnBackend(AttentionBackend):
                 ) = self._get_kv_lens_and_block_tables(
                     kv_lens_cpu=planning_seq_lens_cpu,
                     req_pool_indices=req_pool_indices[:bs],
+                )
+                metadata.dcp_seq_lens.copy_(
+                    metadata.dcp_seq_lens_cpu_int.to(
+                        device=metadata.dcp_seq_lens.device
+                    )
                 )
                 dcp_pages = dcp_block_tables.shape[1]
                 metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_block_tables)
@@ -1257,6 +1284,20 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            if get_parallel().dcp_enabled:
+                return forward_dcp_sparse_attention(
+                    q_nope=q_nope,
+                    q_rope=q_pe,
+                    k_nope=k_nope,
+                    k_rope=k_pe,
+                    topk_indices=topk_indices,
+                    actual_seq_lengths_query=actual_seq_qlen,
+                    forward_metadata=self.forward_metadata,
+                    forward_batch=forward_batch,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    page_size=self.page_size,
+                    scaling=layer.scaling,
+                )
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,

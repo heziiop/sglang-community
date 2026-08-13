@@ -41,6 +41,7 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -74,6 +75,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
@@ -248,13 +251,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
+                if _is_npu:
+                    indexer_size_per_token = index_head_dim * dcp_size
+                    element_size = kv_size
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
                 indexer_ratio = 1
                 if kvc.server_args.enable_hisparse:
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
