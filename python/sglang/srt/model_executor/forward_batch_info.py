@@ -447,6 +447,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Allocator-global output slots before NPU DCP localizes ``out_cache_loc``.
+    # DSA's replicated indexer cache uses the global slot identity.
+    origin_out_cache_loc: Optional[torch.Tensor] = None
+
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
     # they are cloned/relayed into FB-owned copies at the boundary, move them out of
@@ -861,7 +865,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities.
-        # Only the runtime ForwardBatch exposes rank-local NPU DCP write slots.
+        # Preserve that view before exposing rank-local NPU DCP write slots.
+        if _is_npu and get_parallel().dcp_enabled:
+            ret.origin_out_cache_loc = ret.out_cache_loc
         ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(ret.out_cache_loc)
 
         ret._maybe_init_non_generation_fields(batch)
@@ -1486,6 +1492,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.origin_out_cache_loc is not None:
+            self.origin_out_cache_loc = self._pad_tensor_to_size(
+                self.origin_out_cache_loc, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
@@ -1684,6 +1694,9 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        origin_out_cache_loc=getattr(
+            forward_batch, "origin_out_cache_loc", None
+        ),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )

@@ -96,6 +96,28 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
         self.assertIsNone(spec_info.hidden_states)
 
+    def test_padding_preserves_allocator_global_out_cache_locs(self):
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=torch.tensor([11, 12]),
+            req_pool_indices=torch.tensor([5, 6]),
+            seq_lens=torch.tensor([7, 8]),
+            out_cache_loc=torch.tensor([3, -1]),
+            origin_out_cache_loc=torch.tensor([6, 7]),
+            seq_lens_sum=15,
+            positions=torch.tensor([6, 7]),
+            seq_lens_cpu=torch.tensor([7, 8]),
+            lora_ids=[None, None],
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=4, bs=4)
+
+        torch.testing.assert_close(fb.out_cache_loc, torch.tensor([3, -1, 0, 0]))
+        torch.testing.assert_close(
+            fb.origin_out_cache_loc, torch.tensor([6, 7, 0, 0])
+        )
+
     def test_dp_cuda_graph_batch_size_uses_raw_request_counts(self):
         fb = SimpleNamespace(original_global_num_tokens_cpu=[3, 11, 7])
         self.assertEqual(DecodeCudaGraphRunner._max_dp_batch_size(fb), 11)

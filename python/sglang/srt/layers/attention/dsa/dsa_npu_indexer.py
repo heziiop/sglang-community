@@ -3,9 +3,6 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
-    get_replicated_indexer_cache_loc,
-)
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -14,6 +11,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -184,9 +182,20 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
-        get_token_to_kv_pool().set_index_k_buffer(
-            layer_id, get_replicated_indexer_cache_loc(forward_batch, positions), k
-        )
+        indexer_cache_loc = forward_batch.out_cache_loc
+        parallel = get_parallel()
+        if parallel.dcp_enabled and parallel.attn_dcp_size > 1:
+            indexer_cache_loc = (
+                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
+            )
+            assert indexer_cache_loc is not None, (
+                "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
+            )
+            assert indexer_cache_loc.shape[0] == positions.shape[0], (
+                "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
+                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+            )
+        get_token_to_kv_pool().set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp

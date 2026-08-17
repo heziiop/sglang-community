@@ -98,6 +98,7 @@ class ForwardMetadata:
     dcp_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_seq_lens: Optional[torch.Tensor] = None
     dcp_block_tables: Optional[torch.Tensor] = None
+    dcp_origin_out_cache_loc: Optional[torch.Tensor] = None
     # DCP spec inputs: target verify / draft extend
     dcp_spec_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_spec_seq_lens: Optional[torch.Tensor] = None
@@ -482,6 +483,7 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            origin_out_cache_loc=forward_batch.origin_out_cache_loc,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -572,6 +574,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if get_parallel().dcp_enabled:
+            self.forward_metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
             if (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
@@ -675,6 +678,13 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+            # The captured DSA indexer store reads this fixed storage. Replay
+            # refreshes its allocator-global slot ids before graph execution.
+            self.graph_metadata["dcp_origin_out_cache_loc"] = torch.zeros(
+                max_num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -725,6 +735,9 @@ class AscendAttnBackend(AttentionBackend):
         if get_parallel().dcp_enabled and "dcp_block_tables" in self.graph_metadata:
             metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
             metadata.dcp_seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
+            metadata.dcp_origin_out_cache_loc = self.graph_metadata[
+                "dcp_origin_out_cache_loc"
+            ][: out_cache_loc.shape[0]]
         if (
             get_parallel().dcp_enabled
             and "dcp_spec_block_tables" in self.graph_metadata
@@ -806,6 +819,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        origin_out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -863,6 +877,18 @@ class AscendAttnBackend(AttentionBackend):
         # DCP decode/speculative paths use rank-local KV lengths and a block
         # table whose stride is page_size * dcp_world_size.
         if get_parallel().dcp_enabled and "dcp_block_tables" in self.graph_metadata:
+            buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
+            if origin_out_cache_loc is None:
+                buffer.zero_()
+            else:
+                num_tokens = origin_out_cache_loc.shape[0]
+                assert num_tokens <= buffer.shape[0], (
+                    "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
+                    f"{num_tokens} > {buffer.shape[0]}"
+                )
+                buffer[:num_tokens].copy_(origin_out_cache_loc)
+                buffer[num_tokens:].zero_()
+
             if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
                 (
                     metadata.dcp_spec_seq_lens_cpu_int,
@@ -3394,6 +3420,28 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
+    def _step_cache_loc(
+        self,
+        cache_loc: Optional[torch.Tensor],
+        batch_size: int,
+        step_id: int,
+    ) -> Optional[torch.Tensor]:
+        if (
+            cache_loc is None
+            or cache_loc.numel() <= batch_size * self.topk
+        ):
+            return cache_loc
+
+        from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+
+        step_layout_width = self.topk * self.speculative_num_steps
+        return per_step_draft_out_cache_loc(
+            cache_loc,
+            cache_loc.numel() // step_layout_width,
+            self.topk,
+            self.speculative_num_steps,
+        )[step_id]
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -3408,8 +3456,15 @@ class AscendAttnMultiStepDraftBackend:
         )
 
         def call_fn(i, _forward_batch):
+            inner_fb.out_cache_loc = self._step_cache_loc(
+                forward_batch.out_cache_loc, forward_batch.batch_size, i
+            )
+            inner_fb.origin_out_cache_loc = self._step_cache_loc(
+                forward_batch.origin_out_cache_loc, forward_batch.batch_size, i
+            )
             self.attn_backends[i].init_forward_metadata_out_graph(
-                inner_fb, in_capture=in_capture
+                inner_fb,
+                in_capture=in_capture,
             )
 
         self.common_template(forward_batch, call_fn)
@@ -3426,6 +3481,22 @@ class AscendAttnMultiStepDraftBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
         self.common_template(forward_batch, call_fn)
+
+        origin_out_cache_loc = forward_batch.origin_out_cache_loc
+        if origin_out_cache_loc is None:
+            return
+
+        from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+
+        per_step_origin_out_cache_loc = per_step_draft_out_cache_loc(
+            origin_out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        for i in range(self.speculative_num_steps - 1):
+            metadata = self.attn_backends[i].forward_metadata
+            metadata.dcp_origin_out_cache_loc = per_step_origin_out_cache_loc[i]
 
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         for i in range(self.speculative_num_steps):

@@ -11,47 +11,10 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
     remap_dcp_sparse_indices,
 )
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-def get_replicated_indexer_cache_loc(
-    forward_batch: ForwardBatch, positions: torch.Tensor
-) -> torch.Tensor:
-    """Return allocator-global slots used by the replicated DSA indexer cache."""
-    parallel = get_parallel()
-    if not parallel.dcp_enabled or parallel.attn_dcp_size <= 1:
-        return forward_batch.out_cache_loc
-
-    if forward_batch.forward_mode.is_extend_without_speculative():
-        request_rows = torch.repeat_interleave(
-            forward_batch.req_pool_indices,
-            forward_batch.extend_seq_lens.to(torch.int64),
-        )
-    else:
-        tokens_per_request = positions.shape[0] // forward_batch.batch_size
-        request_rows = torch.repeat_interleave(
-            forward_batch.req_pool_indices, tokens_per_request
-        )
-
-    num_valid_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
-    if num_valid_tokens is None:
-        num_valid_tokens = positions.shape[0]
-    num_valid_tokens = min(num_valid_tokens, request_rows.shape[0], positions.shape[0])
-    request_rows = request_rows[:num_valid_tokens]
-    cache_loc = get_req_to_token_pool().req_to_token[
-        request_rows, positions[:num_valid_tokens]
-    ]
-    if num_valid_tokens == positions.shape[0]:
-        return cache_loc
-
-    # Slot zero is reserved for graph padding by the NPU cache pools.
-    return torch.nn.functional.pad(
-        cache_loc, (0, positions.shape[0] - num_valid_tokens)
-    )
 
 
 def forward_dcp_sparse_attention(
