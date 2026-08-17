@@ -46,7 +46,7 @@ def _use_dcp_mla_partial_attention(forward_batch: "ForwardBatch") -> bool:
 
 
 def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
-    return get_parallel().dcp_enabled and not dsa_use_prefill_cp(forward_batch)
+    return get_parallel().dcp_enabled and not dsa_use_prefill_cp(forward_batch) and not forward_batch.forward_mode.is_idle()
 
 
 def _should_use_mha_chunked_kv_npu(
