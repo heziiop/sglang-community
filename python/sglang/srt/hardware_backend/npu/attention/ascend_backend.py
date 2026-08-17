@@ -1321,7 +1321,6 @@ class AscendAttnBackend(AttentionBackend):
                     forward_metadata=self.forward_metadata,
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                    page_size=self.page_size,
                     scaling=layer.scaling,
                 )
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
