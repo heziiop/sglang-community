@@ -315,6 +315,7 @@ class AscendAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.is_draft_worker = model_runner.is_draft_worker
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
@@ -574,7 +575,9 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if get_parallel().dcp_enabled:
-            self.forward_metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
+            self.forward_metadata.dcp_origin_out_cache_loc = (
+                forward_batch.origin_out_cache_loc
+            )
             if (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
@@ -1322,6 +1325,7 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
+                    replicated_kv=self.is_draft_worker,
                 )
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
@@ -3425,10 +3429,7 @@ class AscendAttnMultiStepDraftBackend:
         batch_size: int,
         step_id: int,
     ) -> Optional[torch.Tensor]:
-        if (
-            cache_loc is None
-            or cache_loc.numel() <= batch_size * self.topk
-        ):
+        if cache_loc is None or cache_loc.numel() <= batch_size * self.topk:
             return cache_loc
 
         from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc

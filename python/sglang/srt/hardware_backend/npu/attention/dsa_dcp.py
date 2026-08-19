@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
 import sgl_kernel_npu  # noqa: F401  Registers torch.ops.sgl_kernel_npu.
+import torch
 
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
@@ -30,11 +30,15 @@ def forward_dcp_sparse_attention(
     forward_batch: ForwardBatch,
     speculative_num_draft_tokens: int | None,
     scaling: float,
+    replicated_kv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one rank's sparse partial attention and natural-log LSE."""
     parallel = get_parallel()
-    topk_indices = remap_dcp_sparse_indices(
-        topk_indices, parallel.attn_dcp_size, parallel.attn_dcp_rank
+    topk_indices = _remap_dcp_sparse_indices(
+        topk_indices,
+        parallel.attn_dcp_size,
+        parallel.attn_dcp_rank,
+        replicated_kv=replicated_kv,
     )
     topk_indices = _expand_sparse_indices(topk_indices)
 
@@ -57,6 +61,7 @@ def forward_dcp_sparse_attention(
         is_speculative=is_speculative,
         tokens_per_request=speculative_num_draft_tokens,
         device=q_nope.device,
+        replicated_kv=replicated_kv,
     )
     actual_seq_lengths_query = actual_seq_lengths_query.to(
         device=q_nope.device, dtype=torch.int32
@@ -94,17 +99,58 @@ def _expand_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.unsqueeze(-2) if topk_indices.dim() == 2 else topk_indices
 
 
+def _remap_dcp_sparse_indices(
+    topk_indices: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    *,
+    replicated_kv: bool = False,
+) -> torch.Tensor:
+    """Filter global positions; compact only the rank-local target layout."""
+    if not replicated_kv:
+        return remap_dcp_sparse_indices(topk_indices, dcp_size, dcp_rank)
+    local_mask = (topk_indices >= 0) & (topk_indices % dcp_size == dcp_rank)
+    local_indices = torch.where(
+        local_mask, topk_indices, torch.full_like(topk_indices, -1)
+    )
+    valid_dest = torch.cumsum(local_mask, dim=-1) - 1
+    invalid_dest = (
+        local_mask.sum(dim=-1, keepdim=True) + torch.cumsum(~local_mask, dim=-1) - 1
+    )
+    destination = torch.where(local_mask, valid_dest, invalid_dest).to(torch.int64)
+    return torch.empty_like(local_indices).scatter(-1, destination, local_indices)
+
+
 def _get_local_kv_lens(
     *,
     forward_metadata,
     is_speculative: bool,
     tokens_per_request: int | None,
     device: torch.device,
+    replicated_kv: bool = False,
 ) -> torch.Tensor:
     """Return local KV lengths without host transfers during graph capture."""
     parallel = get_parallel()
     dcp_spec_seq_lens = getattr(forward_metadata, "dcp_spec_seq_lens", None)
     dcp_seq_lens = getattr(forward_metadata, "dcp_seq_lens", None)
+    if replicated_kv:
+        full_lens = getattr(forward_metadata, "seq_lens_cpu_int", None)
+        if full_lens is None:
+            full_lens = forward_metadata.seq_lens
+        if is_speculative:
+            assert tokens_per_request is not None
+            steps = torch.arange(
+                1,
+                tokens_per_request + 1,
+                dtype=full_lens.dtype,
+                device=full_lens.device,
+            )
+            return (
+                (full_lens.unsqueeze(1) - tokens_per_request + steps)
+                .clamp(min=0)[:, -1]
+                .to(device=device, dtype=torch.int32)
+            )
+        return full_lens.to(device=device, dtype=torch.int32)
     if is_speculative and dcp_spec_seq_lens is not None:
         assert tokens_per_request is not None
         return dcp_spec_seq_lens.view(-1, tokens_per_request)[:, -1]

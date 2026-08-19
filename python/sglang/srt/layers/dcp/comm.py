@@ -154,7 +154,7 @@ def cp_lse_ag_out_rs_mla_npu(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
 ) -> torch.Tensor:
-    """Merge NPU DCP partial outputs with one packed all-to-all.
+    """Merge NPU DCP partial outputs with a reference collective.
 
     ``cp_attn_out`` is ``[batch, total_heads, head_dim]`` and ``cp_attn_lse``
     is ``[batch, total_heads]``. The result is
@@ -163,39 +163,23 @@ def cp_lse_ag_out_rs_mla_npu(
     if cp_group.world_size == 1:
         return cp_attn_out
 
-    import torch_npu
-
     batch_size, total_heads, head_dim = cp_attn_out.shape
     world_size = cp_group.world_size
     local_heads = total_heads // world_size
-
-    attn_fp32 = cp_attn_out.to(torch.float32)
-    lse_fp32 = cp_attn_lse.to(torch.float32)
-
-    # [batch, total_heads, head_dim + 1]
-    attn_out_lse = torch.cat([attn_fp32, lse_fp32.unsqueeze(-1)], dim=-1)
-
-    # Split total_heads across ranks during all-to-all.
-    attn_out_lse = attn_out_lse.permute(1, 2, 0).contiguous()
-    attn_all2all = torch.empty_like(attn_out_lse)
-    cp_group.all_to_all_single(attn_all2all, attn_out_lse)
-    attn_out_lse = attn_all2all.permute(2, 0, 1)
-
-    # [world_size, batch * local_heads, head_dim + 1]
-    attn_out_lse = attn_out_lse.view(batch_size, world_size, local_heads, head_dim + 1)
-    attn_out_lse = (
-        attn_out_lse.permute(1, 0, 2, 3)
-        .contiguous()
-        .view(world_size, batch_size * local_heads, head_dim + 1)
+    # Every rank computes all query heads after Q all-gather. Gather the local
+    # LSEs, correct each rank's locally-normalized output, then all-reduce the
+    # corrected outputs. This reference collective avoids backend-specific
+    # all-to-all packing behavior on the NPU path.
+    lses = cp_group.all_gather(cp_attn_lse.to(torch.float32), dim=0).view(
+        world_size, batch_size, total_heads
     )
-
-    out_flat, lse_flat = torch.split(attn_out_lse, [head_dim, 1], dim=-1)
-    out_list = out_flat.unbind(0)
-    lse_list = lse_flat.squeeze(-1).unbind(0)
-
-    merged, _ = torch_npu.npu_attention_update(lse_list, out_list, 0)
-
-    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
+    global_lse = torch.logsumexp(lses, dim=0)
+    scale = torch.exp(cp_attn_lse.to(torch.float32) - global_lse).unsqueeze(-1)
+    out = cp_attn_out.to(torch.float32) * scale
+    cp_group.all_reduce(out)
+    rank = cp_group.rank_in_group
+    out = out[:, rank * local_heads : (rank + 1) * local_heads, :]
+    return out.to(cp_attn_out.dtype)
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
