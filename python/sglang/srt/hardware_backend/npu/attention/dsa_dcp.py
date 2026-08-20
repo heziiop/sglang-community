@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
 import sgl_kernel_npu  # noqa: F401  Registers torch.ops.sgl_kernel_npu.
+import torch
 
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
-    remap_dcp_sparse_indices,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -32,10 +31,6 @@ def forward_dcp_sparse_attention(
     scaling: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one rank's sparse partial attention and natural-log LSE."""
-    parallel = get_parallel()
-    topk_indices = remap_dcp_sparse_indices(
-        topk_indices, parallel.attn_dcp_size, parallel.attn_dcp_rank
-    )
     topk_indices = _expand_sparse_indices(topk_indices)
 
     is_speculative = (

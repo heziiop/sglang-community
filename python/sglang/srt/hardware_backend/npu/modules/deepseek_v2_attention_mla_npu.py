@@ -21,6 +21,7 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla_npu,
 )
+from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
 from sglang.srt.layers.dcp.metadata import NPUMLAPrefixDCPMetadata
 from sglang.srt.layers.dcp.planner import plan_npu_dcp_prefix_segments
 from sglang.srt.model_executor.forward_context import (
@@ -673,6 +674,16 @@ def forward_dsa_prepare_npu(
             layer_scatter_modes,
             dynamic_scale,
         )
+        # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
+        # only when a fresh global top-k is produced so shared-index layers do
+        # not repeat the same DCP partitioning work.
+        if _use_dsa_dcp_partial_attention(forward_batch):
+            parallel = get_parallel()
+            topk_indices = remap_dcp_sparse_indices(
+                topk_indices,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+            )
     else:
         topk_indices = prev_topk_indices
 
