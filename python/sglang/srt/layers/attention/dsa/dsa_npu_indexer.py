@@ -188,9 +188,9 @@ class DSANPUIndexerMixin:
             indexer_cache_loc = (
                 get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
             )
-            assert indexer_cache_loc is not None, (
-                "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
-            )
+            assert (
+                indexer_cache_loc is not None
+            ), "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             assert indexer_cache_loc.shape[0] == positions.shape[0], (
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
@@ -269,7 +269,9 @@ class DSANPUIndexerMixin:
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        block_table = get_attn_backend().forward_metadata.indexer_block_tables
+        if block_table is None:
+            block_table = get_attn_backend().forward_metadata.block_tables
         if (
             is_prefill
             and self.dsa_enable_prefill_cp

@@ -301,6 +301,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_size: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_page_size: Optional[int] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -316,6 +317,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.index_page_size = page_size if index_page_size is None else index_page_size
         self.index_size = size if index_size is None else index_size
 
         self.custom_mem_pool = None
@@ -349,8 +351,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.index_k_buffer = torch.zeros(
                     (
                         layer_num,
-                        self.index_size // self.page_size + 1,
-                        self.page_size,
+                        self.index_size // self.index_page_size + 1,
+                        self.index_page_size,
                         1,
                         self.index_head_dim,
                     ),

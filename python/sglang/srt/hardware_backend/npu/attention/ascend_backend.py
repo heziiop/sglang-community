@@ -78,6 +78,10 @@ class ForwardMetadata:
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
+    # DSA indexer uses the base page size even when draft latent KV uses
+    # replicated pages spanning all DCP ranks.
+    indexer_block_tables: Optional[torch.Tensor] = None
+
     # mapped block_tables for swa
     block_tables_swa: Optional[torch.Tensor] = None
 
@@ -315,11 +319,20 @@ class AscendAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.is_draft_worker = model_runner.is_draft_worker
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
         )
-        self.page_size = model_runner.page_size
+        # DCP draft KV is replicated in the allocator's global virtual slot
+        # space. Its physical pages therefore span all DCP ranks, while the
+        # draft attention path intentionally uses the ordinary (non-partial)
+        # kernel and its regular block-table interface.
+        self.page_size = model_runner.page_size * (
+            get_parallel().attn_dcp_size
+            if self.is_draft_worker and get_parallel().dcp_enabled
+            else 1
+        )
         self.model_dtype = model_runner.model_config.dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
@@ -503,6 +516,17 @@ class AscendAttnBackend(AttentionBackend):
             ][:, :: self.page_size]
             // self.page_size
         )
+        indexer_page_size = (
+            self.page_size // get_parallel().attn_dcp_size
+            if (self.is_draft_worker and get_parallel().dcp_enabled)
+            else self.page_size
+        )
+        self.forward_metadata.indexer_block_tables = (
+            self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :seq_lens_max
+            ][:, ::indexer_page_size]
+            // indexer_page_size
+        ).to(torch.int32)
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -574,27 +598,32 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if get_parallel().dcp_enabled:
-            self.forward_metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
-                (
-                    self.forward_metadata.dcp_spec_seq_lens_cpu_int,
-                    self.forward_metadata.dcp_spec_block_tables,
-                ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    is_spec=True,
-                )
-            else:
-                (
-                    self.forward_metadata.dcp_seq_lens_cpu_int,
-                    self.forward_metadata.dcp_block_tables,
-                ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                )
+            # The draft keeps the allocator-global slot view for its indexer,
+            # but uses ordinary full-KV attention and needs no DCP tables.
+            self.forward_metadata.dcp_origin_out_cache_loc = (
+                forward_batch.origin_out_cache_loc
+            )
+            if not self.is_draft_worker:
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    (
+                        self.forward_metadata.dcp_spec_seq_lens_cpu_int,
+                        self.forward_metadata.dcp_spec_block_tables,
+                    ) = self._get_kv_lens_and_block_tables(
+                        kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        is_spec=True,
+                    )
+                else:
+                    (
+                        self.forward_metadata.dcp_seq_lens_cpu_int,
+                        self.forward_metadata.dcp_block_tables,
+                    ) = self._get_kv_lens_and_block_tables(
+                        kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                    )
 
         if (
             self.use_mla
@@ -651,9 +680,27 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "indexer_block_tables": torch.empty(
+                (
+                    max_bs,
+                    (max_graph_seq_len + self.page_size - 1) // self.page_size,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            ),
         }
+        if self.is_draft_worker and get_parallel().dcp_enabled:
+            indexer_page_size = self.page_size // get_parallel().attn_dcp_size
+            self.graph_metadata["indexer_block_tables"] = torch.empty(
+                (
+                    max_bs,
+                    (max_graph_seq_len + indexer_page_size - 1) // indexer_page_size,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
         # DCP decode needs its own block_table (different stride: dcp_page_size).
-        if get_parallel().dcp_enabled:
+        if get_parallel().dcp_enabled and not self.is_draft_worker:
             dcp_page_size = self.page_size * get_parallel().attn_dcp_size
             max_dcp_seq_pages = (max_graph_seq_len + dcp_page_size - 1) // dcp_page_size
             self.graph_metadata["dcp_block_tables"] = torch.zeros(
@@ -678,6 +725,7 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+        if get_parallel().dcp_enabled:
             # The captured DSA indexer store reads this fixed storage. Replay
             # refreshes its allocator-global slot ids before graph execution.
             self.graph_metadata["dcp_origin_out_cache_loc"] = torch.zeros(
@@ -732,12 +780,17 @@ class AscendAttnBackend(AttentionBackend):
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        if get_parallel().dcp_enabled and "dcp_block_tables" in self.graph_metadata:
-            metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
-            metadata.dcp_seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
-            metadata.dcp_origin_out_cache_loc = self.graph_metadata[
-                "dcp_origin_out_cache_loc"
-            ][: out_cache_loc.shape[0]]
+        metadata.indexer_block_tables = self.graph_metadata["indexer_block_tables"][
+            :bs, :
+        ]
+        if get_parallel().dcp_enabled:
+            if "dcp_origin_out_cache_loc" in self.graph_metadata:
+                metadata.dcp_origin_out_cache_loc = self.graph_metadata[
+                    "dcp_origin_out_cache_loc"
+                ][: out_cache_loc.shape[0]]
+            if not self.is_draft_worker and "dcp_block_tables" in self.graph_metadata:
+                metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
+                metadata.dcp_seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
         if (
             get_parallel().dcp_enabled
             and "dcp_spec_block_tables" in self.graph_metadata
@@ -874,9 +927,23 @@ class AscendAttnBackend(AttentionBackend):
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
 
-        # DCP decode/speculative paths use rank-local KV lengths and a block
-        # table whose stride is page_size * dcp_world_size.
-        if get_parallel().dcp_enabled and "dcp_block_tables" in self.graph_metadata:
+        indexer_page_size = (
+            self.page_size // get_parallel().attn_dcp_size
+            if (self.is_draft_worker and get_parallel().dcp_enabled)
+            else self.page_size
+        )
+        indexer_max_pages = (max_len + indexer_page_size - 1) // indexer_page_size
+        metadata.indexer_block_tables[:bs, :indexer_max_pages].copy_(
+            self.req_to_token[req_pool_indices[:bs], 0:max_len:indexer_page_size]
+            // indexer_page_size
+        )
+        metadata.indexer_block_tables[:bs, indexer_max_pages:].fill_(0)
+        metadata.indexer_block_tables[bs:, :].fill_(0)
+
+        if (
+            get_parallel().dcp_enabled
+            and "dcp_origin_out_cache_loc" in self.graph_metadata
+        ):
             buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
             if origin_out_cache_loc is None:
                 buffer.zero_()
@@ -889,6 +956,14 @@ class AscendAttnBackend(AttentionBackend):
                 buffer[:num_tokens].copy_(origin_out_cache_loc)
                 buffer[num_tokens:].zero_()
 
+        # DCP decode/speculative paths use rank-local KV lengths and a block
+        # table whose stride is page_size * dcp_world_size. Draft attention
+        # uses the ordinary full-KV metadata above instead.
+        if (
+            get_parallel().dcp_enabled
+            and not self.is_draft_worker
+            and "dcp_block_tables" in self.graph_metadata
+        ):
             if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
                 (
                     metadata.dcp_spec_seq_lens_cpu_int,
@@ -1310,7 +1385,7 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-            if get_parallel().dcp_enabled:
+            if get_parallel().dcp_enabled and not self.is_draft_worker:
                 return forward_dcp_sparse_attention(
                     q_nope=q_nope,
                     q_rope=q_pe,
@@ -3425,10 +3500,7 @@ class AscendAttnMultiStepDraftBackend:
         batch_size: int,
         step_id: int,
     ) -> Optional[torch.Tensor]:
-        if (
-            cache_loc is None
-            or cache_loc.numel() <= batch_size * self.topk
-        ):
+        if cache_loc is None or cache_loc.numel() <= batch_size * self.topk:
             return cache_loc
 
         from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc

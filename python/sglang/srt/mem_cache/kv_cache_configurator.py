@@ -276,9 +276,10 @@ class KVCacheConfigurator:
         )
 
     # Note(kpham-sgl):
-    # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
-    #    span and page that space; the sharded target translates and stays per-rank.
-    # 2. A pool must page as its allocator does, or its last page falls short.
+    # 1. A replicated draft latent-KV pool indexes the allocator's virtual locs
+    #    raw and therefore spans/pages that space; its indexer pool keeps the
+    #    base page size because indexer pages are replicated, not widened.
+    # 2. A latent-KV pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
@@ -1232,6 +1233,7 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            index_page_size=get_schedule().page_size,
             index_size=(
                 max_total_num_tokens
                 * get_parallel().attn_dcp_size

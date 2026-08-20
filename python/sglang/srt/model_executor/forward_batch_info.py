@@ -100,10 +100,17 @@ def _elastic_should_preserve_local_token_counts(
 
 def _maybe_localize_npu_dcp_out_cache_loc(
     out_cache_loc: Optional[torch.Tensor],
+    *,
+    is_draft_worker: bool = False,
 ) -> Optional[torch.Tensor]:
     """Return the rank-local NPU DCP write view without mutating scheduler state."""
     parallel = get_parallel()
-    if not _is_npu or not parallel.dcp_enabled or out_cache_loc is None:
+    if (
+        not _is_npu
+        or not parallel.dcp_enabled
+        or is_draft_worker
+        or out_cache_loc is None
+    ):
         return out_cache_loc
 
     is_local = out_cache_loc % parallel.dcp_size == parallel.dcp_rank
@@ -868,7 +875,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Preserve that view before exposing rank-local NPU DCP write slots.
         if _is_npu and get_parallel().dcp_enabled:
             ret.origin_out_cache_loc = ret.out_cache_loc
-        ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(ret.out_cache_loc)
+        ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(
+            ret.out_cache_loc,
+            is_draft_worker=model_runner.is_draft_worker,
+        )
 
         ret._maybe_init_non_generation_fields(batch)
 
@@ -1694,9 +1704,7 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-        origin_out_cache_loc=getattr(
-            forward_batch, "origin_out_cache_loc", None
-        ),
+        origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )

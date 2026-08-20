@@ -40,13 +40,20 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 def _use_dcp_mla_partial_attention(forward_batch: "ForwardBatch") -> bool:
     mode = forward_batch.forward_mode
-    return get_parallel().dcp_enabled and (
-        mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2()
+    return (
+        get_parallel().dcp_enabled
+        and not get_attn_backend().is_draft_worker
+        and (mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2())
     )
 
 
 def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
-    return get_parallel().dcp_enabled and not dsa_use_prefill_cp(forward_batch) and not forward_batch.forward_mode.is_idle()
+    return (
+        get_parallel().dcp_enabled
+        and not get_attn_backend().is_draft_worker
+        and not dsa_use_prefill_cp(forward_batch)
+        and not forward_batch.forward_mode.is_idle()
+    )
 
 
 def _should_use_mha_chunked_kv_npu(

@@ -570,6 +570,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        # NPU DCP keeps the allocator-global slots alongside the localized
+        # write slots.  Draft forwards execute one speculative step at a time,
+        # so the global slot view must follow the same per-step layout before
+        # ForwardBatch padding is applied.
+        origin_out_cache_loc = forward_batch.origin_out_cache_loc
+        if origin_out_cache_loc is not None:
+            origin_out_cache_loc = per_step_draft_out_cache_loc(
+                origin_out_cache_loc,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -629,6 +641,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
+                if origin_out_cache_loc is not None:
+                    forward_batch.origin_out_cache_loc = origin_out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
 
                 canary_index_ctx = (
