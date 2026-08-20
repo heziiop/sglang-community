@@ -93,26 +93,37 @@ def remap_dcp_sparse_indices(
     """Map global sparse token indices to one rank's compact DCP KV layout.
 
     The indexer orders entries by score. Sparse attention requires valid entries
-    before ``-1`` padding, so the rank-owned entries are stably compacted.
+    before ``-1`` padding, so the rank-owned entries are stably compacted. This
+    follows vLLM-Ascend's DCP remap: use float32 owner arithmetic, then sort a
+    partition key and gather the remapped indices. SGLang's current DCP layout
+    has no KV interleave, so the interleave size is one.
     """
     if dcp_size == 1:
         return topk_indices
 
-    local_mask = (topk_indices >= 0) & (topk_indices % dcp_size == dcp_rank)
-    local_indices = torch.where(
-        local_mask,
-        topk_indices // dcp_size,
-        torch.full_like(topk_indices, -1),
+    # Match vLLM-Ascend's remap arithmetic. The current SGLang block layout is
+    # interleave=1: global token p belongs to rank p % dcp_size and maps to
+    # local token p // dcp_size.
+    topk_indices_fp32 = topk_indices.to(torch.float32)
+    local_owner_mask = (topk_indices_fp32 >= 0) & (
+        torch.remainder(topk_indices_fp32, dcp_size) == dcp_rank
     )
+    remapped_indices = torch.where(
+        local_owner_mask,
+        torch.floor(topk_indices_fp32 / dcp_size),
+        torch.full_like(topk_indices_fp32, -1.0),
+    ).to(topk_indices.dtype)
 
-    # Build a stable permutation without sorting: every valid/invalid source gets
-    # its ordinal within that partition, and invalid entries follow all valids.
-    valid_dest = torch.cumsum(local_mask, dim=-1) - 1
-    invalid_dest = (
-        local_mask.sum(dim=-1, keepdim=True) + torch.cumsum(~local_mask, dim=-1) - 1
-    )
-    destination = torch.where(local_mask, valid_dest, invalid_dest).to(torch.int64)
-    return torch.empty_like(local_indices).scatter(-1, destination, local_indices)
+    # Valid entries retain their original top-k order; invalid entries follow
+    # them and retain their source order. This is equivalent to vLLM's
+    # original_order + sort + gather implementation.
+    topk_count = topk_indices.shape[-1]
+    original_order = torch.arange(
+        topk_count, dtype=torch.float32, device=topk_indices.device
+    ).expand_as(topk_indices_fp32)
+    pack_keys = original_order + (~local_owner_mask).to(torch.float32) * topk_count
+    pack_order = torch.argsort(pack_keys, dim=-1).to(torch.int64)
+    return torch.gather(remapped_indices, dim=-1, index=pack_order)
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):
