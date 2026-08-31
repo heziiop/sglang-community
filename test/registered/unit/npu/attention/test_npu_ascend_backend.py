@@ -6,7 +6,7 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -21,6 +21,8 @@ for _ in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.norm",
+    "sgl_kernel_npu.norm.fused_split_qk_norm",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -35,6 +37,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
+)
+from sglang.srt.hardware_backend.npu.modules import (
+    deepseek_v2_attention_mla_npu as npu_mla,
 )
 
 
@@ -686,6 +691,89 @@ class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
     def test_returns_zero(self):
         backend = object.__new__(AscendAttnBackend)
         self.assertEqual(backend.get_cuda_graph_seq_len_fill_value(), 0)
+
+
+class TestDsaDenseFia(unittest.TestCase):
+    @patch.object(npu_mla, "is_mla_preprocess_enabled", return_value=True)
+    @patch.object(npu_mla, "npu_mla_preprocess")
+    def test_prepare_skips_indexer(self, mock_preprocess, _mock_preprocess_enabled):
+        q_pe = torch.randn(2, 1, 8)
+        k_pe = torch.randn(2, 1, 8)
+        q_nope = torch.randn(2, 4, 16)
+        k_nope = torch.randn(2, 1, 16)
+        forward_batch = MagicMock()
+        forward_batch.forward_mode.is_decode.return_value = True
+        zero_allocator = object()
+        positions = torch.arange(2)
+        mock_preprocess.return_value = (
+            q_pe,
+            k_pe,
+            q_nope,
+            k_nope,
+            torch.empty(0),
+            forward_batch,
+            zero_allocator,
+            positions,
+            None,
+        )
+        model = SimpleNamespace(indexer=MagicMock())
+
+        result = npu_mla.forward_dsa_prepare_npu(
+            model,
+            positions,
+            torch.randn(2, 32),
+            forward_batch,
+            zero_allocator,
+            layer_scatter_modes=None,
+            prev_topk_indices=torch.ones(2, 4, dtype=torch.int32),
+        )
+
+        model.indexer.assert_not_called()
+        self.assertEqual(
+            result,
+            (
+                q_pe,
+                k_pe,
+                q_nope,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ),
+        )
+
+    def test_core_does_not_pass_topk(self):
+        num_tokens, num_heads, kv_rank, value_dim = 3, 2, 4, 5
+        model = SimpleNamespace(
+            num_local_heads=num_heads,
+            kv_lora_rank=kv_rank,
+            v_head_dim=value_dim,
+            w_vc=torch.randn(num_heads, kv_rank, value_dim),
+            attn_mqa=MagicMock(
+                return_value=torch.randn(num_tokens, num_heads * kv_rank)
+            ),
+            o_proj=MagicMock(return_value=(torch.randn(num_tokens, 7), None)),
+        )
+        forward_batch = MagicMock()
+        forward_batch.forward_mode.is_extend.return_value = True
+        forward_batch.forward_mode.is_draft_extend_v2.return_value = False
+        forward_batch.forward_mode.is_target_verify.return_value = False
+
+        expected = model.o_proj.return_value[0]
+        result = npu_mla.forward_dsa_core_npu(
+            model,
+            q_pe=torch.randn(num_tokens, num_heads, 2),
+            k_pe=torch.randn(num_tokens, 1, 2),
+            q_nope_out=torch.randn(num_tokens, num_heads, kv_rank),
+            k_nope=torch.randn(num_tokens, 1, kv_rank),
+            forward_batch=forward_batch,
+            zero_allocator=object(),
+            positions=torch.arange(num_tokens),
+        )
+
+        self.assertIs(result, expected)
+        call_kwargs = model.attn_mqa.call_args.kwargs
+        self.assertNotIn("topk_indices", call_kwargs)
 
 
 class TestGetVerifyBuffers(unittest.TestCase):

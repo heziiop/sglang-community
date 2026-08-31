@@ -302,6 +302,10 @@ def _cp_allgather_and_save_kv_npu(
 
 class AscendAttnBackend(AttentionBackend):
 
+    # Ascend DSA is executed as dense FIA, so no index tensor needs to be
+    # generated, shared between layers, or forwarded between PP stages.
+    uses_dsa_topk = False
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -1215,9 +1219,10 @@ class AscendAttnBackend(AttentionBackend):
                 sinks=sinks,
             )
 
-        if topk_indices is not None and self.use_mla:
-            # Ignore DSA top-k indices and adapt its split nope/rope inputs to
-            # the combined tensors expected by the dense MLA extend path.
+        if getattr(layer, "use_dsa_dense_attention", False) and self.use_mla:
+            # Adapt DSA's split nope/rope inputs to the combined tensors used
+            # by the dense MLA extend path.
+            assert q_rope is not None and k_rope is not None
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
@@ -2785,7 +2790,11 @@ class AscendAttnBackend(AttentionBackend):
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if (self.use_fia or topk_indices is not None) and (
+            if (
+                self.use_fia
+                or getattr(layer, "use_dsa_dense_attention", False)
+                or topk_indices is not None
+            ) and (
                 layer.tp_q_head_num // layer.tp_k_head_num
             ) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""

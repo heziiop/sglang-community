@@ -356,18 +356,17 @@ def forward_dsa_prepare_npu(
     layer_scatter_modes,
     prev_topk_indices: torch.Tensor = None,
 ):
-    dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
         (
             q_pe,
             k_pe,
             q_nope_out,
             k_nope,
-            q_lora,
+            _q_lora,
             forward_batch,
             zero_allocator,
             positions,
-            dynamic_scale,
+            _dynamic_scale,
         ) = npu_mla_preprocess(
             m,
             hidden_states,
@@ -390,7 +389,7 @@ def forward_dsa_prepare_npu(
             ):
                 q = scattered_to_tp_attn_full(q, forward_batch)
                 latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
-            q_lora = q.clone()  # required for topk_indices
+            q_lora = q
 
             q_event = None
             if m.alt_stream is not None:
@@ -434,7 +433,7 @@ def forward_dsa_prepare_npu(
                 # overlap qk norm
                 q = m.q_a_layernorm(q)
 
-                q_lora = q.clone()  # required for topk_indices
+                q_lora = q
                 k_nope, k_pe = latent_cache.unsqueeze(1).split(
                     [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
                 )
@@ -460,25 +459,11 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
-        topk_indices = m.indexer(
-            hidden_states,
-            q_lora,
-            positions,
-            forward_batch,
-            m.layer_id,
-            layer_scatter_modes,
-            dynamic_scale,
-        )
-    else:
-        topk_indices = prev_topk_indices
-
     return (
         q_pe,
         k_pe,
         q_nope_out,
         k_nope,
-        topk_indices,
         forward_batch,
         zero_allocator,
         positions,
@@ -491,7 +476,6 @@ def forward_dsa_core_npu(
     k_pe: torch.Tensor,
     q_nope_out: torch.Tensor,
     k_nope: torch.Tensor,
-    topk_indices: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
@@ -508,7 +492,6 @@ def forward_dsa_core_npu(
         save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
         q_rope=q_pe.contiguous(),
         k_rope=k_pe.contiguous(),
-        topk_indices=topk_indices,
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
@@ -540,10 +523,7 @@ def forward_dsa_core_npu(
     if gate is not None:
         attn_bmm_output = m._apply_gated(attn_bmm_output, gate)
     output, _ = m.o_proj(attn_bmm_output)
-    if not m.next_skip_topk:
-        return output, None
-    else:
-        return output, topk_indices
+    return output
 
 
 def npu_mla_preprocess(

@@ -1921,6 +1921,7 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        self.attn_mqa.use_dsa_dense_attention = self.use_dsa
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
@@ -1933,6 +1934,7 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("attn_mqa", prefix),
             )
+            self.attn_mqa_for_dcp_decode.use_dsa_dense_attention = self.use_dsa
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
@@ -2782,6 +2784,8 @@ class DeepseekV2Model(nn.Module):
             return False
         backend = get_attn_backend()
         backend = getattr(backend, "primary", backend)
+        if not getattr(backend, "uses_dsa_topk", True):
+            return False
         return not getattr(backend, "use_mha", False)
 
     def forward(
