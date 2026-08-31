@@ -1199,18 +1199,6 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
             )
-        if topk_indices is not None:
-            return self.forward_sparse(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache,
-                q_rope,
-                k_rope,
-                topk_indices,
-            )
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -1226,6 +1214,19 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
                 sinks=sinks,
             )
+
+        if topk_indices is not None and self.use_mla:
+            # Ignore DSA top-k indices and adapt its split nope/rope inputs to
+            # the combined tensors expected by the dense MLA extend path.
+            if save_kv_cache:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k.view(-1, layer.tp_k_head_num, self.kv_lora_rank),
+                    k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim),
+                )
+            q = torch.cat([q, q_rope], dim=-1)
+            k = torch.cat([k, k_rope], dim=-1)
 
         if not self.use_mla:
             # Detect CP mode for prefill (context parallel)
@@ -2530,18 +2531,8 @@ class AscendAttnBackend(AttentionBackend):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO does saving kv_cache
             save_kv_cache = False
-        if topk_indices is not None:
-            return self.forward_sparse(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache,
-                q_rope,
-                k_rope,
-                topk_indices,
-            )
+        # DSA top-k indices are intentionally ignored; the dense path below owns
+        # both the cache write and attention computation.
 
         if self.graph_mode and (not self.enable_torch_compile):
             return self.forward_decode_graph(
@@ -2794,7 +2785,9 @@ class AscendAttnBackend(AttentionBackend):
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
+            if (self.use_fia or topk_indices is not None) and (
+                layer.tp_q_head_num // layer.tp_k_head_num
+            ) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
