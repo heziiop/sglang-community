@@ -91,6 +91,11 @@ _DEEPEP_AUTO_SYNC = os.getenv("SGLANG_DEEPEP_AUTO_SYNC", "0") == "1"
 _DEEPEP_AUTO_BOUNDARY_BARRIER = (
     os.getenv("SGLANG_DEEPEP_AUTO_BOUNDARY_BARRIER", "0") == "1"
 )
+# Diagnostic isolation knob: allocate one underlying DeepEP runtime per mode
+# instead of sharing the AUTO buffer between normal and low-latency calls.
+_DEEPEP_AUTO_SEPARATE_BUFFERS = (
+    os.getenv("SGLANG_DEEPEP_AUTO_SEPARATE_BUFFERS", "0") == "1"
+)
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
 
@@ -210,6 +215,7 @@ class DeepEPBuffer:
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
+                mode_buffers={},
                 dispatch_mode=None,
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
@@ -229,7 +235,12 @@ class DeepEPBuffer:
         num_experts: int = -1,
     ):
         state = cls._state()
-        if state.buffer is not None:
+        buffer_key = (
+            deepep_mode.value if _DEEPEP_AUTO_SEPARATE_BUFFERS else "shared"
+        )
+        if buffer_key != "shared" and buffer_key in state.mode_buffers:
+            return state.mode_buffers[buffer_key]
+        if buffer_key == "shared" and state.buffer is not None:
             return state.buffer
 
         state.hidden_size = hidden_size
@@ -319,26 +330,33 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
-        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        new_buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if buffer_key == "shared":
+            state.buffer = new_buffer
+        else:
+            state.mode_buffers[buffer_key] = new_buffer
         if _DEEPEP_DIAG:
             logger.warning(
                 "DeepEP buffer created rank=%s requested_mode=%s low_latency_mode=%s "
                 "num_nvl_bytes=%s num_rdma_bytes=%s num_qps_per_rank=%s",
                 group.rank(),
                 deepep_mode.value,
-                getattr(state.buffer, "low_latency_mode", None),
+                getattr(new_buffer, "low_latency_mode", None),
                 num_nvl_bytes,
                 num_rdma_bytes,
                 num_qps_per_rank,
             )
-        return state.buffer
+        return new_buffer
 
     @classmethod
     def clean_buffer(cls):
         state = cls._state()
-        if not state.buffer.low_latency_mode:
+        buffer = state.buffer
+        if _DEEPEP_AUTO_SEPARATE_BUFFERS:
+            buffer = state.mode_buffers.get(DeepEPMode.LOW_LATENCY.value)
+        if buffer is None or not buffer.low_latency_mode:
             return
-        state.buffer.clean_low_latency_buffer(
+        buffer.clean_low_latency_buffer(
             state.num_max_dispatch_tokens_per_rank,
             state.hidden_size,
             state.num_experts,
@@ -694,11 +712,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
+        buffer_mode = (
+            DeepEPMode.NORMAL
+            if _DEEPEP_AUTO_SEPARATE_BUFFERS and self.deepep_mode == DeepEPMode.AUTO
+            else self.deepep_mode
+        )
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
-            self.deepep_mode,
+            buffer_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
@@ -900,11 +923,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        buffer_mode = (
+            DeepEPMode.LOW_LATENCY
+            if _DEEPEP_AUTO_SEPARATE_BUFFERS and self.deepep_mode == DeepEPMode.AUTO
+            else self.deepep_mode
+        )
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
-            self.deepep_mode,
+            buffer_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
