@@ -364,14 +364,19 @@ class DeepEPBuffer:
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
+        state = cls._state()
+        previous = state.dispatch_mode
+        state.dispatch_mode = DeepEPDispatchMode.NORMAL
+        return previous
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
         state = cls._state()
+        previous = state.dispatch_mode
         if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
         state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        return previous
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
@@ -559,6 +564,21 @@ class _DeepEPDispatcherImplBase:
         self.overlap_args = None
         self.meta_overlap_args = None
 
+    def _diag_buffer_mode(self, mode, previous_dispatch_mode, buffer) -> None:
+        if not _DEEPEP_DIAG or self.deepep_mode != DeepEPMode.AUTO:
+            return
+        logger.warning(
+            "DeepEP diag buffer_mode rank=%s seq=%s impl=%s mode=%s previous_global=%s "
+            "buffer_id=%s buffer_low_latency_mode=%s",
+            self.group.rank(),
+            getattr(self, "_diag_seq", -1),
+            type(self).__name__,
+            mode,
+            getattr(previous_dispatch_mode, "name", None),
+            id(buffer),
+            getattr(buffer, "low_latency_mode", None),
+        )
+
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     dispatch_mode = DeepEPMode.NORMAL
@@ -710,14 +730,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_normal()
+        previous_dispatch_mode = DeepEPBuffer.set_dispatch_mode_as_normal()
 
         buffer_mode = (
             DeepEPMode.NORMAL
             if _DEEPEP_AUTO_SEPARATE_BUFFERS and self.deepep_mode == DeepEPMode.AUTO
             else self.deepep_mode
         )
-        return DeepEPBuffer.get_deepep_buffer(
+        buffer = DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
@@ -725,7 +745,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
-
+        self._diag_buffer_mode("normal", previous_dispatch_mode, buffer)
+        return buffer
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     dispatch_mode = DeepEPMode.LOW_LATENCY
@@ -922,13 +943,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        previous_dispatch_mode = DeepEPBuffer.set_dispatch_mode_as_low_latency()
         buffer_mode = (
             DeepEPMode.LOW_LATENCY
             if _DEEPEP_AUTO_SEPARATE_BUFFERS and self.deepep_mode == DeepEPMode.AUTO
             else self.deepep_mode
         )
-        return DeepEPBuffer.get_deepep_buffer(
+        buffer = DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
@@ -936,6 +957,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+        self._diag_buffer_mode("low_latency", previous_dispatch_mode, buffer)
+        return buffer
 
 
 @dataclass
