@@ -81,6 +81,16 @@ _DEEPEP_DIAG_COLLECTIVE = (
 # resolution to one implementation.  This is intentionally opt-in and has no
 # effect for NORMAL/LOW_LATENCY command-line modes.
 _DEEPEP_AUTO_FORCE_MODE = os.getenv("SGLANG_DEEPEP_AUTO_FORCE_MODE", "").strip()
+# Force the DeepEP Python wrapper to use synchronous completion for AUTO.  This
+# is a diagnostic-only switch to separate SGLang's async event/hook integration
+# from the operator's normal/low-latency mixed-mode behavior.
+_DEEPEP_AUTO_SYNC = os.getenv("SGLANG_DEEPEP_AUTO_SYNC", "0") == "1"
+# Strongly synchronize AUTO mode boundaries for diagnosis.  This is separate
+# from AUTO_SYNC: it preserves the normal async DeepEP API but ensures a prior
+# transaction has completed on every EP rank before the next one starts.
+_DEEPEP_AUTO_BOUNDARY_BARRIER = (
+    os.getenv("SGLANG_DEEPEP_AUTO_BOUNDARY_BARRIER", "0") == "1"
+)
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
 
@@ -929,6 +939,14 @@ class DeepEPDispatcher(BaseDispatcher):
         # only to the inner normal/low-latency implementations.
         self.group = group
         self.deepep_mode = deepep_mode
+        if self.deepep_mode == DeepEPMode.AUTO and _DEEPEP_AUTO_SYNC:
+            async_finish = False
+            return_recv_hook = False
+            if _DEEPEP_DIAG:
+                logger.warning(
+                    "DeepEP diag: AUTO synchronous mode enabled; "
+                    "async_finish=False return_recv_hook=False"
+                )
 
         common_kwargs = dict(
             group=group,
@@ -991,6 +1009,7 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        self._auto_boundary_sync("before_dispatch")
         self._diag_seq += 1
         self._active_mode = self._resolve_mode()
         self._active_impl = self._impl_for_mode(self._active_mode)
@@ -1045,9 +1064,29 @@ class DeepEPDispatcher(BaseDispatcher):
         self._diag_trace("combine_b.before_impl")
         ret = self._active_impl.combine_b(*inner_state)
         self._diag_trace("combine_b.after_impl")
+        self._auto_boundary_sync("after_combine")
         self._active_impl = None
         self._active_mode = None
         return ret
+
+    def _auto_boundary_sync(self, boundary: str) -> None:
+        if (
+            not _DEEPEP_AUTO_BOUNDARY_BARRIER
+            or self.deepep_mode != DeepEPMode.AUTO
+        ):
+            return
+        if _is_npu:
+            torch.npu.synchronize()
+        else:
+            torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+        if _DEEPEP_DIAG:
+            logger.warning(
+                "DeepEP diag boundary synchronized rank=%s seq=%s boundary=%s",
+                self.group.rank(),
+                self._diag_seq,
+                boundary,
+            )
 
     def _resolve_mode(self) -> DeepEPMode:
         is_extend_in_batch = get_is_extend_in_batch()
