@@ -73,6 +73,9 @@ logger = logging.getLogger(__name__)
 # before dispatch so rank-inconsistent mode/call sequences fail with a Python
 # error instead of leaving an NPU kernel polling indefinitely.
 _DEEPEP_DIAG = os.getenv("SGLANG_DEEPEP_DIAG", "0") == "1"
+_DEEPEP_DIAG_COLLECTIVE = (
+    os.getenv("SGLANG_DEEPEP_DIAG_COLLECTIVE", "1") == "1"
+)
 # Diagnostic isolation knob: keep the user-visible mode as AUTO (therefore
 # both implementations and the AUTO buffer are initialized), but force AUTO
 # resolution to one implementation.  This is intentionally opt-in and has no
@@ -1094,7 +1097,11 @@ class DeepEPDispatcher(BaseDispatcher):
         raise ValueError(f"Invalid resolved deepep_mode: {mode}")
 
     def _diag_check(self, device) -> None:
-        if not _DEEPEP_DIAG or self.deepep_mode != DeepEPMode.AUTO:
+        if (
+            not _DEEPEP_DIAG
+            or not _DEEPEP_DIAG_COLLECTIVE
+            or self.deepep_mode != DeepEPMode.AUTO
+        ):
             return
         mode_id = 0 if self._active_mode == DeepEPMode.NORMAL else 1
         local = torch.tensor(
