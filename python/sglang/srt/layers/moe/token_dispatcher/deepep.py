@@ -102,6 +102,10 @@ _DEEPEP_AUTO_SEPARATE_BUFFERS = (
 _DEEPEP_AUTO_SKIP_GLOBAL_MODE = (
     os.getenv("SGLANG_DEEPEP_AUTO_SKIP_GLOBAL_MODE", "0") == "1"
 )
+# Set to 0 for a control run that restores the original per-stage AUTO
+# implementation resolution.  The default keeps the transaction lock enabled
+# for the earlier diagnostic experiments.
+_DEEPEP_AUTO_PIN_IMPL = os.getenv("SGLANG_DEEPEP_AUTO_PIN_IMPL", "1") == "1"
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
 
@@ -1080,7 +1084,8 @@ class DeepEPDispatcher(BaseDispatcher):
         self._active_impl = self._impl_for_mode(self._active_mode)
         self._diag_trace("dispatch_a.before_impl")
         self._diag_check(hidden_states.device)
-        inner_state = self._active_impl.dispatch_a(
+        impl = self._active_impl if _DEEPEP_AUTO_PIN_IMPL else self._get_impl()
+        inner_state = impl.dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
@@ -1092,8 +1097,8 @@ class DeepEPDispatcher(BaseDispatcher):
         self._diag_trace("dispatch_b.before_impl")
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        assert self._active_impl is not None
-        ret = self._active_impl.dispatch_b(*inner_state)
+        impl = self._active_impl if _DEEPEP_AUTO_PIN_IMPL else self._get_impl()
+        ret = impl.dispatch_b(*inner_state)
         self._diag_trace("dispatch_b.after_impl")
         return ret
 
@@ -1111,9 +1116,9 @@ class DeepEPDispatcher(BaseDispatcher):
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        assert self._active_impl is not None
+        impl = self._active_impl if _DEEPEP_AUTO_PIN_IMPL else self._get_impl()
         self._diag_trace("combine_a.before_impl")
-        inner_state = self._active_impl.combine_a(
+        inner_state = impl.combine_a(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -1125,9 +1130,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        assert self._active_impl is not None
+        impl = self._active_impl if _DEEPEP_AUTO_PIN_IMPL else self._get_impl()
         self._diag_trace("combine_b.before_impl")
-        ret = self._active_impl.combine_b(*inner_state)
+        ret = impl.combine_b(*inner_state)
         self._diag_trace("combine_b.after_impl")
         self._auto_boundary_sync("after_combine")
         self._active_impl = None
@@ -1227,7 +1232,7 @@ class DeepEPDispatcher(BaseDispatcher):
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         # Compatibility path for external hooks; normal dispatch/combine uses
         # the transaction-level _active_impl above.
-        if self._active_impl is not None:
+        if _DEEPEP_AUTO_PIN_IMPL and self._active_impl is not None:
             return self._active_impl
         return self._impl_for_mode(self._resolve_mode())
 
