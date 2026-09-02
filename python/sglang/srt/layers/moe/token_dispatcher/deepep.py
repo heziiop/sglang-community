@@ -96,6 +96,12 @@ _DEEPEP_AUTO_BOUNDARY_BARRIER = (
 _DEEPEP_AUTO_SEPARATE_BUFFERS = (
     os.getenv("SGLANG_DEEPEP_AUTO_SEPARATE_BUFFERS", "0") == "1"
 )
+# Skip the process-wide Python dispatch_mode bookkeeping in AUTO.  The NPU
+# Buffer methods receive their mode-specific API directly; this flag isolates
+# possible interference from the shared adapter state.
+_DEEPEP_AUTO_SKIP_GLOBAL_MODE = (
+    os.getenv("SGLANG_DEEPEP_AUTO_SKIP_GLOBAL_MODE", "0") == "1"
+)
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
 
@@ -730,7 +736,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
-        previous_dispatch_mode = DeepEPBuffer.set_dispatch_mode_as_normal()
+        previous_dispatch_mode = None
+        if not (
+            _DEEPEP_AUTO_SKIP_GLOBAL_MODE and self.deepep_mode == DeepEPMode.AUTO
+        ):
+            previous_dispatch_mode = DeepEPBuffer.set_dispatch_mode_as_normal()
 
         buffer_mode = (
             DeepEPMode.NORMAL
@@ -943,7 +953,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
-        previous_dispatch_mode = DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        previous_dispatch_mode = None
+        if not (
+            _DEEPEP_AUTO_SKIP_GLOBAL_MODE and self.deepep_mode == DeepEPMode.AUTO
+        ):
+            previous_dispatch_mode = DeepEPBuffer.set_dispatch_mode_as_low_latency()
         buffer_mode = (
             DeepEPMode.LOW_LATENCY
             if _DEEPEP_AUTO_SEPARATE_BUFFERS and self.deepep_mode == DeepEPMode.AUTO
