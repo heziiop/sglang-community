@@ -71,6 +71,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
+# Opt-in diagnostics for DeepEP AUTO.  This adds a small EP-group all-gather
+# before dispatch so rank-inconsistent mode/call sequences fail with a Python
+# error instead of leaving an NPU kernel polling indefinitely.
+_DEEPEP_DIAG = os.getenv("SGLANG_DEEPEP_DIAG", "0") == "1"
+# Diagnostic isolation knob: keep the user-visible mode as AUTO (therefore
+# both implementations and the AUTO buffer are initialized), but force AUTO
+# resolution to one implementation.  This is intentionally opt-in and has no
+# effect for NORMAL/LOW_LATENCY command-line modes.
+_DEEPEP_AUTO_FORCE_MODE = os.getenv("SGLANG_DEEPEP_AUTO_FORCE_MODE", "").strip()
+
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
 
 
@@ -297,6 +307,17 @@ class DeepEPBuffer:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if _DEEPEP_DIAG:
+            logger.warning(
+                "DeepEP buffer created rank=%s requested_mode=%s low_latency_mode=%s "
+                "num_nvl_bytes=%s num_rdma_bytes=%s num_qps_per_rank=%s",
+                group.rank(),
+                deepep_mode.value,
+                getattr(state.buffer, "low_latency_mode", None),
+                num_nvl_bytes,
+                num_rdma_bytes,
+                num_qps_per_rank,
+            )
         return state.buffer
 
     @classmethod
@@ -925,6 +946,12 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        # Resolve AUTO once per dispatch/combine transaction.  Re-resolving at
+        # every stage can select different implementations if a forward or
+        # overlap context changes between dispatch_a and combine_b.
+        self._active_impl: Optional[_DeepEPDispatcherImplBase] = None
+        self._active_mode: Optional[DeepEPMode] = None
+        self._diag_seq = 0
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
@@ -957,17 +984,27 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
+        self._diag_seq += 1
+        self._active_mode = self._resolve_mode()
+        self._active_impl = self._impl_for_mode(self._active_mode)
+        self._diag_trace("dispatch_a.before_impl")
+        self._diag_check(hidden_states.device)
+        inner_state = self._active_impl.dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        self._diag_trace("dispatch_a.after_impl")
         self._dispatch_intermediate_state = inner_state
 
     def dispatch_b(self):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
+        self._diag_trace("dispatch_b.before_impl")
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        assert self._active_impl is not None
+        ret = self._active_impl.dispatch_b(*inner_state)
+        self._diag_trace("dispatch_b.after_impl")
+        return ret
 
     def combine(
         self,
@@ -983,28 +1020,101 @@ class DeepEPDispatcher(BaseDispatcher):
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl().combine_a(
+        assert self._active_impl is not None
+        self._diag_trace("combine_a.before_impl")
+        inner_state = self._active_impl.combine_a(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
+        self._diag_trace("combine_a.after_impl")
         self._combine_intermediate_state = inner_state
 
     def combine_b(self):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        assert self._active_impl is not None
+        self._diag_trace("combine_b.before_impl")
+        ret = self._active_impl.combine_b(*inner_state)
+        self._diag_trace("combine_b.after_impl")
+        self._active_impl = None
+        self._active_mode = None
+        return ret
+
+    def _resolve_mode(self) -> DeepEPMode:
+        is_extend_in_batch = get_is_extend_in_batch()
+        natural = self.deepep_mode.resolve(is_extend_in_batch)
+        resolved = natural
+        if self.deepep_mode == DeepEPMode.AUTO and _DEEPEP_AUTO_FORCE_MODE:
+            if _DEEPEP_AUTO_FORCE_MODE not in ("normal", "low_latency"):
+                raise ValueError(
+                    "SGLANG_DEEPEP_AUTO_FORCE_MODE must be empty, normal, or low_latency; "
+                    f"got {_DEEPEP_AUTO_FORCE_MODE!r}"
+                )
+            resolved = DeepEPMode(_DEEPEP_AUTO_FORCE_MODE)
+        if _DEEPEP_DIAG and self.deepep_mode == DeepEPMode.AUTO:
+            logger.warning(
+                "DeepEP diag rank=%s seq=%s is_extend_in_batch=%s natural=%s forced=%s resolved=%s",
+                self.group.rank(),
+                self._diag_seq,
+                is_extend_in_batch,
+                natural.value,
+                _DEEPEP_AUTO_FORCE_MODE or "none",
+                resolved.value,
+            )
+        return resolved
+
+    def _diag_trace(self, stage: str) -> None:
+        if not _DEEPEP_DIAG or self.deepep_mode != DeepEPMode.AUTO:
+            return
+        state = DeepEPBuffer._state()
+        dispatch_mode = getattr(state.dispatch_mode, "name", None)
+        buffer = getattr(state, "buffer", None)
+        logger.warning(
+            "DeepEP diag trace rank=%s seq=%s stage=%s active=%s global_dispatch_mode=%s "
+            "buffer_low_latency_mode=%s",
+            self.group.rank(),
+            self._diag_seq,
+            stage,
+            self._active_mode.value if self._active_mode is not None else "none",
+            dispatch_mode,
+            getattr(buffer, "low_latency_mode", None),
+        )
+
+    def _impl_for_mode(self, mode: DeepEPMode) -> _DeepEPDispatcherImplBase:
+        if mode == DeepEPMode.NORMAL:
+            return self._normal_dispatcher
+        if mode == DeepEPMode.LOW_LATENCY:
+            return self._low_latency_dispatcher
+        raise ValueError(f"Invalid resolved deepep_mode: {mode}")
+
+    def _diag_check(self, device) -> None:
+        if not _DEEPEP_DIAG or self.deepep_mode != DeepEPMode.AUTO:
+            return
+        mode_id = 0 if self._active_mode == DeepEPMode.NORMAL else 1
+        local = torch.tensor(
+            [self._diag_seq, int(get_is_extend_in_batch()), mode_id],
+            dtype=torch.int32,
+            device=device,
+        )
+        gathered = torch.empty(
+            (self.group.size(), 3), dtype=torch.int32, device=device
+        )
+        dist.all_gather_into_tensor(gathered, local, group=self.group)
+        rows = gathered.cpu().tolist()
+        if any(row != rows[0] for row in rows[1:]):
+            raise RuntimeError(
+                "DeepEP AUTO rank disagreement before dispatch: "
+                f"rank={self.group.rank()} rows(seq,is_extend,mode)={rows}"
+            )
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
-        is_extend_in_batch = get_is_extend_in_batch()
-        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
-        if resolved_deepep_mode == DeepEPMode.NORMAL:
-            return self._normal_dispatcher
-        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
-            return self._low_latency_dispatcher
-        else:
-            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+        # Compatibility path for external hooks; normal dispatch/combine uses
+        # the transaction-level _active_impl above.
+        if self._active_impl is not None:
+            return self._active_impl
+        return self._impl_for_mode(self._resolve_mode())
 
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
