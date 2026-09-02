@@ -921,6 +921,10 @@ class DeepEPDispatcher(BaseDispatcher):
     ):
         super().__init__()
 
+        # Keep the communication group on the outer dispatcher for diagnostics
+        # and rank-consistency checks.  The original implementation passed it
+        # only to the inner normal/low-latency implementations.
+        self.group = group
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
