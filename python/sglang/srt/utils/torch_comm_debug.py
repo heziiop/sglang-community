@@ -1,9 +1,10 @@
 """Optional instrumentation for diagnosing NPU distributed deadlocks.
 
 Set ``SGLANG_NPU_COMM_DEBUG=1`` before starting workers to instrument public
-``torch.distributed`` communication APIs.  Every call is synchronized and
-logged before and after invocation.  The default is intentionally disabled so
-there is no impact on normal runs.
+``torch.distributed`` communication APIs.  Every NPU call is synchronized and
+logged before and after invocation.  CPU-side communication logging is
+controlled separately by ``SGLANG_NPU_COMM_DEBUG_CPU=1`` and is disabled by
+default.
 """
 
 from __future__ import annotations
@@ -84,6 +85,11 @@ def _enabled() -> bool:
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
+def _cpu_logging_enabled() -> bool:
+    value = os.getenv("SGLANG_NPU_COMM_DEBUG_CPU", "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
 def _next_sequence() -> int:
     global _sequence
     with _sequence_lock:
@@ -137,6 +143,31 @@ def _tensor_summary(value: Any) -> str | None:
     return None
 
 
+def _contains_npu_tensor(value: Any) -> bool:
+    """Whether an argument contains at least one tensor resident on NPU."""
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            return getattr(value.device, "type", None) == "npu"
+    except Exception:
+        return False
+    if isinstance(value, dict):
+        return any(_contains_npu_tensor(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_contains_npu_tensor(item) for item in value)
+    return False
+
+
+def _should_trace_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    """Filter CPU-only torch.distributed calls from the default NPU trace."""
+    return (
+        _cpu_logging_enabled()
+        or _contains_npu_tensor(args)
+        or _contains_npu_tensor(kwargs)
+    )
+
+
 def _arguments_summary(
     args: tuple[Any, ...], kwargs: dict[str, Any], *, process_group_method: bool = False
 ) -> str:
@@ -177,6 +208,9 @@ def _wrap(
         # Protect against accidental recursion if a backend implementation
         # reaches another instrumented public API while synchronizing.
         if getattr(_reentrancy, "active", False):
+            return original(*args, **kwargs)
+
+        if not _should_trace_call(args, kwargs):
             return original(*args, **kwargs)
 
         _reentrancy.active = True
