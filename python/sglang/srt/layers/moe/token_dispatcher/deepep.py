@@ -61,7 +61,8 @@ except ImportError:
     use_deepep = False
 
 from sglang.srt.utils.torch_comm_debug import (
-    maybe_capture_deepep_mismatch,
+    arm_deepep_hang_capture,
+    disarm_deepep_hang_capture,
     record_deepep_snapshot,
     trace_deepep_call as _trace_deepep_call,
 )
@@ -666,9 +667,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             {},
             combine_tokens=hidden_states.shape[0],
         )
-        maybe_capture_deepep_mismatch(
+        self._hang_capture_id = arm_deepep_hang_capture(
             group=get_tp_group().cpu_group,
-            is_extend_in_batch=get_is_extend_in_batch(),
         )
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
@@ -681,6 +681,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        disarm_deepep_hang_capture(
+            getattr(self, "_hang_capture_id", None),
+            group=get_tp_group().cpu_group,
+        )
         self.handle = None
         self.src2dst = None
         return hidden_states
@@ -855,9 +859,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             {},
             combine_tokens=hidden_states.shape[0],
         )
-        maybe_capture_deepep_mismatch(
+        self._hang_capture_id = arm_deepep_hang_capture(
             group=get_tp_group().cpu_group,
-            is_extend_in_batch=get_is_extend_in_batch(),
         )
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -872,6 +875,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
         hook() if self.return_recv_hook else event.current_stream_wait()
+        disarm_deepep_hang_capture(
+            getattr(self, "_hang_capture_id", None),
+            group=get_tp_group().cpu_group,
+        )
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)

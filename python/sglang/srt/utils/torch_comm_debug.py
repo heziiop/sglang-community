@@ -8,7 +8,9 @@ default.  DeepEP input capture is controlled by
 ``SGLANG_NPU_DEEPEP_CAPTURE_DIR`` and
 ``SGLANG_NPU_DEEPEP_CAPTURE_MODE`` (``mismatch``/``all``/``once``/``seq``/``error``).
 For ``seq`` mode, set ``SGLANG_NPU_DEEPEP_CAPTURE_SEQ`` to the local sequence
-number to persist.
+number to persist.  ``mismatch`` watches every DeepEP combine and saves the
+first globally timed-out call; configure its deadline with
+``SGLANG_NPU_DEEPEP_CAPTURE_TIMEOUT_SEC`` (default: 30 seconds).
 """
 
 from __future__ import annotations
@@ -79,6 +81,7 @@ _sequence_lock = threading.Lock()
 _reentrancy = threading.local()
 _deepep_capture_state: dict[str, Any] = {}
 _deepep_capture_id = 0
+_deepep_capture_lock = threading.Lock()
 
 
 def _is_wrapped(value: Any) -> bool:
@@ -122,6 +125,14 @@ def _capture_seq() -> int | None:
         return int(value) if value else None
     except ValueError:
         return None
+
+
+def _capture_timeout() -> float:
+    value = os.getenv("SGLANG_NPU_DEEPEP_CAPTURE_TIMEOUT_SEC", "30")
+    try:
+        return max(float(value), 0.1)
+    except ValueError:
+        return 30.0
 
 
 def _next_sequence() -> int:
@@ -421,60 +432,102 @@ def record_deepep_snapshot(
 
 
 def _flush_mismatch_capture(
-    dispatch: dict[str, Any], combine: dict[str, Any], gathered: list[dict[str, Any]]
+    dispatch: dict[str, Any], combine: dict[str, Any]
 ) -> None:
     directory = _capture_dir()
-    if directory is None or _deepep_capture_state.get("mismatch_saved"):
+    if directory is None:
         return
     for payload in (dispatch, combine):
-        cpu_payload = _clone_for_capture(payload)
-        cpu_payload = _capture_value(cpu_payload)
-        _save_capture_payload(directory, cpu_payload)
-    _deepep_capture_state["mismatch_saved"] = True
+        # Watchdogs must never access NPU state: these payloads were moved to
+        # CPU synchronously before the real combine call.
+        _save_capture_payload(directory, payload)
 
 
-def maybe_capture_deepep_mismatch(
-    *,
-    group: Any,
-    is_extend_in_batch: bool,
-) -> bool:
-    """Detect mixed-step token mismatch with a Gloo all-gather and save inputs."""
+def arm_deepep_hang_capture(*, group: Any) -> int | None:
+    """Arm a watchdog before a DeepEP combine."""
     if _capture_dir() is None or _capture_mode() != "mismatch" or not _has_npu():
-        return False
+        return None
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        return False
+        return None
+    with _deepep_capture_lock:
+        if _deepep_capture_state.get("mismatch_saved"):
+            return None
     dispatch = _deepep_capture_state.get("last_dispatch")
     combine = _deepep_capture_state.get("last_combine")
     if dispatch is None or combine is None:
-        return False
-    gathered: list[dict[str, Any]] = [dict() for _ in range(dist.get_world_size(group))]
-    dist.all_gather_object(
-        gathered,
-        {
-            "global_rank": dispatch.get("global_rank", -1),
-            "extend": bool(is_extend_in_batch),
-            "dispatch_tokens": int(dispatch.get("dispatch_tokens", 0)),
-            "topk": int(dispatch.get("topk", 0)),
-            "combine_tokens": int(combine.get("combine_tokens", 0)),
-        },
-        group=group,
-    )
-    mixed = any(item.get("extend") for item in gathered) and not all(
-        item.get("extend") for item in gathered
-    )
-    dispatch_total = sum(item.get("dispatch_tokens", 0) * item.get("topk", 0) for item in gathered)
-    combine_total = sum(item.get("combine_tokens", 0) for item in gathered)
-    mismatch = mixed and dispatch_total != combine_total
-    if mismatch:
-        _deepep_capture_state["mismatch_pending"] = True
+        return None
+    capture_id = int(combine["seq"])
+    with _deepep_capture_lock:
+        _deepep_capture_state["armed_capture_id"] = capture_id
+    return capture_id
+
+
+def _start_deepep_hang_watchdog(
+    capture_id: int,
+    dispatch_payload: dict[str, Any],
+    combine_payload: dict[str, Any],
+) -> None:
+    """Move snapshots to CPU and arm a CPU-only timeout callback."""
+    # .cpu() is intentionally completed before combine is launched.  If the
+    # communication stream hangs later, the timer can still persist the data
+    # without synchronizing or otherwise touching the NPU runtime.
+    cpu_dispatch_payload = _capture_value(dispatch_payload)
+    cpu_combine_payload = _capture_value(combine_payload)
+
+    def watchdog() -> None:
+        with _deepep_capture_lock:
+            pending = _deepep_capture_state.setdefault("pending", {}).pop(
+                capture_id, None
+            )
+            if pending is None or _deepep_capture_state.get("mismatch_saved"):
+                return
+            _deepep_capture_state["mismatch_saved"] = True
+        _flush_mismatch_capture(
+            pending["dispatch_payload"], pending["combine_payload"]
+        )
         print(
-            f"[NPU-COMM] deepep_mismatch mixed=1 dispatch_tokens_topk={dispatch_total} "
-            f"combine_tokens={combine_total}",
+            f"[NPU-COMM] deepep_hang_capture timeout={_capture_timeout()} "
+            f"capture_id={capture_id}",
             flush=True,
         )
-    return mismatch
+
+    timer = threading.Timer(
+        _capture_timeout(),
+        watchdog,
+    )
+    timer.name = f"deepep-capture-{capture_id}"
+    timer.daemon = True
+    with _deepep_capture_lock:
+        if _deepep_capture_state.get("mismatch_saved"):
+            return
+        _deepep_capture_state.setdefault("pending", {})[capture_id] = {
+            "timer": timer,
+            "dispatch_payload": cpu_dispatch_payload,
+            "combine_payload": cpu_combine_payload,
+        }
+    timer.start()
+
+
+def disarm_deepep_hang_capture(capture_id: int | None, *, group: Any) -> None:
+    """Confirm all ranks returned, then disarm their local watchdogs.
+
+    If one rank remains inside DeepEP combine, peers wait in this Gloo
+    collective and every rank's watchdog retains the same replay snapshot.
+    """
+    if capture_id is None:
+        return
+    import torch.distributed as dist
+
+    completed: list[bool] = [False for _ in range(dist.get_world_size(group))]
+    dist.all_gather_object(completed, True, group=group)
+    with _deepep_capture_lock:
+        pending = _deepep_capture_state.setdefault("pending", {}).pop(
+            capture_id, None
+        )
+    if pending is not None:
+        pending["timer"].cancel()
 
 
 def _int_from_details(details: str, name: str) -> int:
@@ -583,16 +636,16 @@ def _wrap_deepep(
                     _deepep_capture_state["last_lowlevel_dispatch"] = raw_payload
                 elif ".combine" in log_name:
                     _deepep_capture_state["last_lowlevel_combine"] = raw_payload
-                    if _deepep_capture_state.get("mismatch_pending"):
+                    capture_id = _deepep_capture_state.get("armed_capture_id")
+                    if capture_id is not None:
                         dispatch_payload = _deepep_capture_state.get(
                             "last_lowlevel_dispatch"
                         ) or _deepep_capture_state.get("last_dispatch")
                         if dispatch_payload is not None:
-                            directory = _capture_dir()
-                            if directory is not None:
-                                _flush_mismatch_capture(
-                                    dispatch_payload, raw_payload, []
-                                )
+                            _start_deepep_hang_watchdog(
+                                int(capture_id), dispatch_payload, raw_payload
+                            )
+                        _deepep_capture_state["armed_capture_id"] = None
             capture_payload = _capture_deepep_inputs(
                 log_name,
                 sequence,
@@ -750,7 +803,8 @@ def trace_deepep_call(
     op_name: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
 ) -> Any:
     """Trace one DeepEP call site when class-level patching is unavailable."""
-    if not _enabled() or not _has_npu() or _is_wrapped(fn):
+    capture_enabled = _capture_dir() is not None
+    if (not _enabled() and not capture_enabled) or not _has_npu() or _is_wrapped(fn):
         return fn(*args, **kwargs)
     method_name = next(
         (name for name, label in _DEEPEP_OPS.items() if label == op_name), None
