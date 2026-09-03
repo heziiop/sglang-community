@@ -32,6 +32,7 @@ _LINE_RE = re.compile(
     r"op=(?P<op>\S+)"
     r"(?:\s+(?P<details>.*))?$"
 )
+_READY_RE = re.compile(r"ready\s+to\s+roll", re.IGNORECASE)
 
 
 @dataclass
@@ -108,8 +109,16 @@ def _group_key(record: Record) -> str:
 
 def _parse_stream(stream: TextIO, source: str) -> list[Record]:
     records: list[Record] = []
+    ready_to_roll = False
     for line_number, line in enumerate(stream, 1):
-        match = _LINE_RE.search(line.rstrip("\n"))
+        text = line.rstrip("\n")
+        if not ready_to_roll:
+            if not _READY_RE.search(text):
+                continue
+            ready_to_roll = True
+            # The marker line itself is not a communication record unless a
+            # communication log happens to follow it on the same line.
+        match = _LINE_RE.search(text)
         if not match:
             continue
         pid_text = match.group("pid")
