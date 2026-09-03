@@ -153,6 +153,13 @@ def init_npu_backend():
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
+    # Optional communication tracing for diagnosing NPU rank desynchronization.
+    # Install last so backend monkey patches above cannot replace the wrappers.
+    # Disabled by default; enable with SGLANG_NPU_COMM_DEBUG=1.
+    from sglang.srt.utils.torch_comm_debug import install_torch_comm_debug
+
+    install_torch_comm_debug()
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
