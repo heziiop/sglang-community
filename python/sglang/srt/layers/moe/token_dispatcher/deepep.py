@@ -60,6 +60,22 @@ try:
 except ImportError:
     use_deepep = False
 
+from sglang.srt.utils.torch_comm_debug import trace_deepep_call as _trace_deepep_call
+
+if use_deepep and _is_npu and not _use_zbal:
+    # Optional tracing for DeepEP's custom normal/low-latency communication
+    # kernels.  This is a no-op unless SGLANG_NPU_COMM_DEBUG is enabled.
+    from sglang.srt.utils.torch_comm_debug import install_deepep_comm_debug
+
+    install_deepep_comm_debug(Buffer)
+
+
+def trace_deepep_call(op_name, fn, *args, **kwargs):
+    """Trace only the NPU deep_ep path; leave zbal/non-NPU untouched."""
+    if use_deepep and _is_npu and not _use_zbal:
+        return _trace_deepep_call(op_name, fn, *args, **kwargs)
+    return fn(*args, **kwargs)
+
 from enum import Enum, IntEnum, auto
 
 import torch
@@ -574,7 +590,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_expert,
             is_token_in_rank,
             previous_event,
-        ) = buffer.get_dispatch_layout(
+        ) = trace_deepep_call(
+            "deepep.normal.get_dispatch_layout",
+            buffer.get_dispatch_layout,
             topk_ids,
             self.num_experts,
             previous_event=previous_event,
@@ -593,7 +611,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_recv_tokens_per_expert,
             self.handle,
             event,
-        ) = buffer.dispatch(
+        ) = trace_deepep_call(
+            "deepep.normal.dispatch",
+            buffer.dispatch,
             x,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
@@ -647,7 +667,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        combined_x, _, event = buffer.combine(
+        combined_x, _, event = trace_deepep_call(
+            "deepep.normal.combine",
+            buffer.combine,
             x,
             self.handle,
             async_finish=self.async_finish,
@@ -767,7 +789,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
-            buffer.low_latency_dispatch(
+            trace_deepep_call(
+                "deepep.low_latency.dispatch",
+                buffer.low_latency_dispatch,
                 hidden_states,
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
@@ -851,7 +875,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         with ctx:
             _deepep_precompile_tp_barrier()
-            combined_hidden_states, event, hook = buffer.low_latency_combine(
+            combined_hidden_states, event, hook = trace_deepep_call(
+                "deepep.low_latency.combine",
+                buffer.low_latency_combine,
                 x=hidden_states,
                 topk_idx=topk_ids,
                 topk_weights=topk_weights,

@@ -58,10 +58,25 @@ _PROCESS_GROUP_OPS = (
     "send",
 )
 
+_DEEPEP_OPS = {
+    "get_dispatch_layout": "deepep.normal.get_dispatch_layout",
+    "dispatch": "deepep.normal.dispatch",
+    "combine": "deepep.normal.combine",
+    "low_latency_dispatch": "deepep.low_latency.dispatch",
+    "low_latency_combine": "deepep.low_latency.combine",
+}
+
 _installed = False
 _sequence = 0
 _sequence_lock = threading.Lock()
 _reentrancy = threading.local()
+
+
+def _is_wrapped(value: Any) -> bool:
+    return bool(
+        getattr(value, "__sglang_npu_comm_debug__", False)
+        or getattr(getattr(value, "__func__", None), "__sglang_npu_comm_debug__", False)
+    )
 
 
 def _enabled() -> bool:
@@ -84,6 +99,15 @@ def _sync_npu() -> None:
     synchronize = getattr(npu, "synchronize", None)
     if synchronize is not None:
         synchronize()
+
+
+def _has_npu() -> bool:
+    try:
+        import torch
+
+        return callable(getattr(getattr(torch, "npu", None), "synchronize", None))
+    except Exception:
+        return False
 
 
 def _rank_and_world(group: Any) -> tuple[int, int]:
@@ -186,6 +210,45 @@ def _wrap(
     return wrapped
 
 
+def _wrap_deepep(
+    op_name: str, original: Callable[..., Any], *, bound_method: bool = False
+) -> Callable[..., Any]:
+    """Wrap a DeepEP Buffer communication method."""
+    log_name = _DEEPEP_OPS[op_name]
+
+    @functools.wraps(original)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if getattr(_reentrancy, "active", False):
+            return original(*args, **kwargs)
+
+        _reentrancy.active = True
+        sequence = _next_sequence()
+        # Exclude ``self`` from tensor summaries.  DeepEP's Buffer generally
+        # stores its process group internally; rank/world still come from the
+        # default process group, which is the one used by the dispatcher.
+        details = _arguments_summary(args if bound_method else args[1:], kwargs)
+        try:
+            _log(log_name, "before", sequence, details)
+            _sync_npu()
+            result = original(*args, **kwargs)
+            _sync_npu()
+            _log(log_name, "after", sequence, details)
+            return result
+        except BaseException as exc:
+            _log(
+                log_name,
+                "error",
+                sequence,
+                f"{details},exc={type(exc).__name__}:{exc}",
+            )
+            raise
+        finally:
+            _reentrancy.active = False
+
+    wrapped.__sglang_npu_comm_debug__ = True  # type: ignore[attr-defined]
+    return wrapped
+
+
 def _rebind_loaded_sglang_aliases(
     original: Callable[..., Any], wrapped: Callable[..., Any]
 ) -> None:
@@ -231,7 +294,7 @@ def install_torch_comm_debug() -> bool:
             if not hasattr(module, op_name):
                 continue
             original = getattr(module, op_name)
-            if getattr(original, "__sglang_npu_comm_debug__", False):
+            if _is_wrapped(original):
                 continue
             if not callable(original):
                 continue
@@ -262,3 +325,54 @@ def install_torch_comm_debug() -> bool:
 
     _installed = patched_count > 0
     return _installed
+
+
+def install_deepep_comm_debug(*buffer_types: type[Any]) -> bool:
+    """Instrument DeepEP normal and low-latency Buffer methods.
+
+    The NPU path uses the ``deep_ep`` Buffer class.  Missing packages and
+    immutable C extension types are ignored; torch.distributed tracing remains
+    available.
+    """
+    if not _enabled():
+        return False
+
+    if not buffer_types:
+        candidates = (("deep_ep", "Buffer"),)
+        discovered: list[type[Any]] = []
+        for module_name, class_name in candidates:
+            try:
+                module = __import__(module_name, fromlist=[class_name])
+                candidate = getattr(module, class_name, None)
+                if isinstance(candidate, type):
+                    discovered.append(candidate)
+            except (ImportError, AttributeError):
+                continue
+        buffer_types = tuple(discovered)
+
+    patched = False
+    for buffer_type in buffer_types:
+        for method_name in _DEEPEP_OPS:
+            try:
+                original = getattr(buffer_type, method_name)
+                if _is_wrapped(original):
+                    continue
+                setattr(buffer_type, method_name, _wrap_deepep(method_name, original))
+                patched = True
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+    return patched
+
+
+def trace_deepep_call(
+    op_name: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Trace one DeepEP call site when class-level patching is unavailable."""
+    if not _enabled() or not _has_npu() or _is_wrapped(fn):
+        return fn(*args, **kwargs)
+    method_name = next(
+        (name for name, label in _DEEPEP_OPS.items() if label == op_name), None
+    )
+    if method_name is None:
+        return fn(*args, **kwargs)
+    return _wrap_deepep(method_name, fn, bound_method=True)(*args, **kwargs)
