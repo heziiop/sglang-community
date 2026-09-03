@@ -43,6 +43,9 @@ class Record:
     phase: str
     op: str
     details: str = ""
+    global_rank: int | None = None
+    world: int | None = None
+    group_ranks: tuple[int, ...] = ()
 
 
 @dataclass
@@ -58,6 +61,10 @@ class Issue:
 @dataclass
 class RankReport:
     rank: str
+    global_rank: int | None = None
+    world: int | None = None
+    group_key: str = "unknown"
+    group_ranks: list[int] = field(default_factory=list)
     process_ids: list[int] = field(default_factory=list)
     records: int = 0
     calls: int = 0
@@ -65,12 +72,38 @@ class RankReport:
     pending: int = 0
     errors: int = 0
     issues: list[Issue] = field(default_factory=list)
+    warnings: list[Issue] = field(default_factory=list)
     operations: list[str] = field(default_factory=list)
 
 
 def _rank_from_details(details: str) -> str | None:
     match = re.search(r"(?:^|,)rank=(-?\d+)(?:,|$)", details)
     return match.group(1) if match else None
+
+
+def _int_from_details(details: str, name: str) -> int | None:
+    match = re.search(rf"(?:^|,){re.escape(name)}=(-?\d+)(?:,|$)", details)
+    return int(match.group(1)) if match else None
+
+
+def _group_ranks_from_details(details: str) -> tuple[int, ...]:
+    match = re.search(r"(?:^|,)group_ranks=([^,\[]+|unknown)(?:,tensors=|$)", details)
+    if not match or match.group(1) == "unknown":
+        return ()
+    try:
+        return tuple(int(item) for item in match.group(1).split("|"))
+    except ValueError:
+        return ()
+
+
+def _group_key(record: Record) -> str:
+    if record.op.startswith("deepep."):
+        return "deepep-global"
+    if record.group_ranks:
+        return "group[" + "|".join(str(item) for item in record.group_ranks) + "]"
+    if record.world is not None:
+        return f"world={record.world}:unknown-members"
+    return "unknown"
 
 
 def _parse_stream(stream: TextIO, source: str) -> list[Record]:
@@ -89,18 +122,24 @@ def _parse_stream(stream: TextIO, source: str) -> list[Record]:
                 phase=match.group("phase"),
                 op=match.group("op"),
                 details=match.group("details") or "",
+                global_rank=_int_from_details(match.group("details") or "", "global_rank"),
+                world=_int_from_details(match.group("details") or "", "world"),
+                group_ranks=_group_ranks_from_details(match.group("details") or ""),
             )
         )
     return records
 
 
 def _rank_key(record: Record, source_index: int) -> str:
-    rank = _rank_from_details(record.details)
-    if rank is not None and rank != "-1":
-        return f"rank{rank}"
+    rank = record.global_rank
+    if rank is None:
+        rank_text = _rank_from_details(record.details)
+        rank = int(rank_text) if rank_text is not None else None
+    if rank is not None and rank != -1:
+        return f"{_group_key(record)}/rank{rank}"
     if record.pid is not None:
-        return f"pid{record.pid}"
-    return f"source{source_index}"
+        return f"{_group_key(record)}/pid{record.pid}"
+    return f"{_group_key(record)}/source{source_index}"
 
 
 def _issue(
@@ -121,14 +160,37 @@ def _issue(
     )
 
 
+def _warning(
+    report: RankReport,
+    kind: str,
+    message: str,
+    record: Record | None = None,
+) -> None:
+    report.warnings.append(
+        Issue(
+            kind=kind,
+            message=message,
+            rank=report.rank,
+            source=record.source if record else None,
+            line=record.line if record else None,
+            seq=record.seq if record else None,
+        )
+    )
+
+
 def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankReport]:
     reports: dict[str, RankReport] = {}
     for rank, records in records_by_rank.items():
         report = RankReport(rank=rank, records=len(records))
+        first_record = records[0]
+        report.global_rank = first_record.global_rank
+        report.world = first_record.world
+        report.group_ranks = list(first_record.group_ranks)
+        report.group_key = _group_key(first_record)
         process_ids = sorted({record.pid for record in records if record.pid is not None})
         report.process_ids = process_ids
         if len(process_ids) > 1:
-            _issue(
+            _warning(
                 report,
                 "multiple_processes_same_rank",
                 f"rank contains multiple pids: {','.join(map(str, process_ids))}; "
@@ -218,51 +280,84 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
     return reports
 
 
-def _compare_operations(reports: dict[str, RankReport]) -> list[Issue]:
+def _compare_operations(
+    reports: dict[str, RankReport], *, deepep_world_size: int = 16
+) -> list[Issue]:
     issues: list[Issue] = []
-    if len(reports) < 2:
-        return issues
-    ranks = sorted(reports)
-    reference = reports[ranks[0]]
-    for rank in ranks[1:]:
-        candidate = reports[rank]
-        common = min(len(reference.operations), len(candidate.operations))
-        mismatch_index = next(
-            (
-                index
-                for index in range(common)
-                if reference.operations[index] != candidate.operations[index]
-            ),
-            None,
-        )
-        if mismatch_index is not None:
-            issues.append(
-                Issue(
-                    kind="operation_order_mismatch",
-                    message=(
-                        f"{rank} differs from {reference.rank} at call "
-                        f"#{mismatch_index + 1}: "
-                        f"{candidate.operations[mismatch_index]} "
-                        f"vs {reference.operations[mismatch_index]}"
-                    ),
-                    rank=rank,
-                )
+    reports_by_group: dict[str, list[RankReport]] = defaultdict(list)
+    for report in reports.values():
+        reports_by_group[report.group_key].append(report)
+    for group_key, group_reports in reports_by_group.items():
+        if len(group_reports) < 2:
+            continue
+        # A rank with multiple process ids contains multiple independent
+        # sequence counters.  Do not compare its merged operation list against
+        # another rank; the per-pid completion checks above remain valid.
+        if any(len(report.process_ids) > 1 for report in group_reports):
+            continue
+        group_reports.sort(key=lambda report: report.rank)
+        reference = group_reports[0]
+        for candidate in group_reports[1:]:
+            rank = candidate.rank
+            common = min(len(reference.operations), len(candidate.operations))
+            mismatch_index = next(
+                (
+                    index
+                    for index in range(common)
+                    if reference.operations[index] != candidate.operations[index]
+                ),
+                None,
             )
-        if len(reference.operations) != len(candidate.operations):
+            if mismatch_index is not None:
+                issues.append(
+                    Issue(
+                        kind="operation_order_mismatch",
+                        message=(
+                            f"{rank} differs from {reference.rank} in group "
+                            f"{group_key} at call #{mismatch_index + 1}: "
+                            f"{candidate.operations[mismatch_index]} vs "
+                            f"{reference.operations[mismatch_index]}"
+                        ),
+                        rank=rank,
+                    )
+                )
+            if len(reference.operations) != len(candidate.operations):
+                issues.append(
+                    Issue(
+                        kind="operation_count_mismatch",
+                        message=(
+                            f"{rank} has {len(candidate.operations)} calls, while "
+                            f"{reference.rank} has {len(reference.operations)} in "
+                            f"group {group_key}"
+                        ),
+                        rank=rank,
+                    )
+                )
+    deepep_reports = reports_by_group.get("deepep-global", [])
+    if deepep_reports and deepep_world_size > 0:
+        present = {
+            report.global_rank
+            for report in deepep_reports
+            if report.global_rank is not None and report.global_rank >= 0
+        }
+        missing = sorted(set(range(deepep_world_size)) - present)
+        if missing:
             issues.append(
                 Issue(
-                    kind="operation_count_mismatch",
+                    kind="deepep_missing_ranks",
                     message=(
-                        f"{rank} has {len(candidate.operations)} calls, while "
-                        f"{reference.rank} has {len(reference.operations)}"
+                        f"DeepEP logs are missing global rank(s) {missing}; "
+                        f"expected {deepep_world_size} total rank(s)"
                     ),
-                    rank=rank,
+                    rank="deepep-global",
                 )
             )
     return issues
 
 
-def analyze(paths: Iterable[str]) -> tuple[dict[str, RankReport], list[Issue], int]:
+def analyze(
+    paths: Iterable[str], *, deepep_world_size: int = 16
+) -> tuple[dict[str, RankReport], list[Issue], int]:
     records_by_rank: dict[str, list[Record]] = defaultdict(list)
     parsed_lines = 0
     for source_index, path in enumerate(paths):
@@ -278,7 +373,9 @@ def analyze(paths: Iterable[str]) -> tuple[dict[str, RankReport], list[Issue], i
     for records in records_by_rank.values():
         records.sort(key=lambda record: (record.seq, record.line, record.phase))
     reports = _build_reports(records_by_rank)
-    cross_rank_issues = _compare_operations(reports)
+    cross_rank_issues = _compare_operations(
+        reports, deepep_world_size=deepep_world_size
+    )
     return reports, cross_rank_issues, parsed_lines
 
 
@@ -294,14 +391,29 @@ def _print_text(
         print(
             f"{rank}: calls={report.calls}, completed={report.completed}, "
             f"pending={report.pending}, errors={report.errors}, "
-            f"issues={len(report.issues)}"
+            f"issues={len(report.issues)}, warnings={len(report.warnings)}"
         )
     issues = [issue for report in reports.values() for issue in report.issues]
     issues.extend(cross_rank_issues)
+    warnings = [warning for report in reports.values() for warning in report.warnings]
     if not issues:
-        print("RESULT: OK - no communication ordering or completion mismatch found.")
+        suffix = f" ({len(warnings)} warning(s))" if warnings else ""
+        print(
+            "RESULT: OK - no communication ordering or completion mismatch found."
+            + suffix
+        )
+        for warning in warnings:
+            location = ""
+            if warning.source is not None:
+                location = f" ({warning.source}:{warning.line})"
+            print(f"- [warning:{warning.kind}] {warning.message}{location}")
         return
     print(f"RESULT: PROBLEM - found {len(issues)} issue(s).")
+    for warning in warnings:
+        location = ""
+        if warning.source is not None:
+            location = f" ({warning.source}:{warning.line})"
+        print(f"- [warning:{warning.kind}] {warning.message}{location}")
     for issue in issues:
         location = ""
         if issue.source is not None:
@@ -319,6 +431,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json", action="store_true", help="emit a machine-readable JSON report"
     )
+    parser.add_argument(
+        "--deepep-world-size",
+        type=int,
+        default=16,
+        help="expected number of global ranks for DeepEP calls (default: 16)",
+    )
     args = parser.parse_args(argv)
 
     expanded: list[str] = []
@@ -332,15 +450,19 @@ def main(argv: list[str] | None = None) -> int:
             expanded.append(item)
     expanded = list(dict.fromkeys(expanded))
 
-    reports, cross_rank_issues, parsed_lines = analyze(expanded)
+    reports, cross_rank_issues, parsed_lines = analyze(
+        expanded, deepep_world_size=args.deepep_world_size
+    )
     all_issues = [issue for report in reports.values() for issue in report.issues]
     all_issues.extend(cross_rank_issues)
+    warnings = [warning for report in reports.values() for warning in report.warnings]
     if args.json:
         payload = {
             "parsed_records": parsed_lines,
             "ranks": {rank: asdict(report) for rank, report in reports.items()},
             "cross_rank_issues": [asdict(issue) for issue in cross_rank_issues],
             "issues": [asdict(issue) for issue in all_issues],
+            "warnings": [asdict(warning) for warning in warnings],
             "ok": not all_issues and parsed_lines > 0,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))

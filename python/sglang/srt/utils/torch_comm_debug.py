@@ -116,16 +116,26 @@ def _has_npu() -> bool:
         return False
 
 
-def _rank_and_world(group: Any) -> tuple[int, int]:
+def _rank_and_world(group: Any) -> tuple[int, int, tuple[int, ...]]:
     try:
         import torch.distributed as dist
 
         if not dist.is_available() or not dist.is_initialized():
-            return -1, -1
-        return dist.get_rank(group=group), dist.get_world_size(group=group)
+            return -1, -1, ()
+        rank = dist.get_rank(group=group)
+        world = dist.get_world_size(group=group)
+        group_ranks: tuple[int, ...]
+        try:
+            get_group_ranks = getattr(dist, "get_process_group_ranks")
+            group_ranks = tuple(int(item) for item in get_group_ranks(group))
+        except (AttributeError, RuntimeError, TypeError):
+            # Older torch versions do not expose group membership.  The
+            # default group is still unambiguous, so reconstruct that case.
+            group_ranks = tuple(range(world)) if group is None else ()
+        return rank, world, group_ranks
     except Exception:
         # Logging must not hide the original communication exception.
-        return -1, -1
+        return -1, -1, ()
 
 
 def _tensor_summary(value: Any) -> str | None:
@@ -181,8 +191,15 @@ def _arguments_summary(
     # ProcessGroup methods receive the ProcessGroup instance as ``self``;
     # public torch.distributed functions receive it as the ``group`` kwarg.
     group = args[0] if process_group_method and args else kwargs.get("group")
-    rank, world = _rank_and_world(group)
-    return f"rank={rank},world={world},tensors=[{' ; '.join(tensors)}]"
+    rank, world, group_ranks = _rank_and_world(group)
+    global_rank = (
+        group_ranks[rank] if 0 <= rank < len(group_ranks) else -1
+    )
+    members = "|".join(str(item) for item in group_ranks) or "unknown"
+    return (
+        f"rank={rank},global_rank={global_rank},world={world},"
+        f"group_ranks={members},tensors=[{' ; '.join(tensors)}]"
+    )
 
 
 def _log(op_name: str, phase: str, sequence: int, details: str) -> None:
