@@ -23,12 +23,59 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
-import torch
-import torch.distributed as dist
+
+def _prepend_env_path(name: str, path: Path) -> bool:
+    value = str(path)
+    entries = [item for item in os.environ.get(name, "").split(":") if item]
+    if value in entries:
+        return False
+    os.environ[name] = ":".join([value, *entries])
+    return True
+
+
+def _bootstrap_deepep_custom_ops() -> None:
+    """Expose DeepEP's bundled Ascend custom ops before loading torch/CANN."""
+    spec = importlib.util.find_spec("deep_ep")
+    if spec is None or spec.origin is None:
+        raise ImportError("deep_ep is not installed in this Python environment")
+
+    package_dir = Path(spec.origin).resolve().parent
+    vendor_dir = package_dir / "vendors" / "hwcomputing"
+    op_api_dir = vendor_dir / "op_api" / "lib"
+    op_api_lib = op_api_dir / "libcust_opapi.so"
+    if not op_api_lib.is_file():
+        raise RuntimeError(
+            f"DeepEP custom op library is missing: {op_api_lib}. "
+            "Install a DeepEP-Ascend wheel built for this CANN/device version."
+        )
+
+    changed = _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_dir)
+    changed = _prepend_env_path("LD_LIBRARY_PATH", op_api_dir) or changed
+    # glibc reads LD_LIBRARY_PATH when the process starts. Re-exec once so
+    # deep_ep_cpp's dlopen("libcust_opapi.so") resolves this library rather
+    # than falling back to the system libopapi.so.
+    if changed and os.environ.get("SGLANG_DEEPEP_REPLAY_BOOTSTRAPPED") != "1":
+        environment = os.environ.copy()
+        environment["SGLANG_DEEPEP_REPLAY_BOOTSTRAPPED"] = "1"
+        os.execvpe(
+            sys.executable,
+            [sys.executable, *sys.argv],
+            environment,
+        )
+
+
+_bootstrap_deepep_custom_ops()
+
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+import torch_npu  # noqa: E402, F401
+from deep_ep import Buffer  # noqa: E402
 
 
 def _restore(value: Any, device: torch.device) -> Any:
@@ -124,8 +171,6 @@ def _get_process_group_options(backend: str) -> tuple[Any, int | None]:
     if backend != "hccl":
         return None, None
 
-    import torch_npu
-
     hccl_buffer_size = int(
         os.environ.get("DEEPEP_HCCL_BUFFSIZE")
         or os.environ.get("HCCL_BUFFSIZE")
@@ -154,8 +199,6 @@ def main() -> int:
     pg_options, hccl_buffer_size = _get_process_group_options(args.backend)
     dist.init_process_group(args.backend, pg_options=pg_options)
 
-    import deep_ep
-
     prefix = f"deepep.{args.mode}"
     dispatch = _load(
         _latest_capture(args.capture_dir, f"{prefix}.dispatch", global_rank),
@@ -168,7 +211,7 @@ def main() -> int:
     low_latency = args.mode == "low_latency"
     inferred_nvl_bytes, inferred_rdma_bytes, num_qps_per_rank = (
         _infer_buffer_settings(
-            deep_ep.Buffer,
+            Buffer,
             dispatch,
             low_latency=low_latency,
             world_size=dist.get_world_size(),
@@ -183,7 +226,7 @@ def main() -> int:
             f"hccl_buffer_size_mb={hccl_buffer_size}",
             flush=True,
         )
-    buffer = deep_ep.Buffer(
+    buffer = Buffer(
         dist.group.WORLD,
         nvl_bytes,
         rdma_bytes,
