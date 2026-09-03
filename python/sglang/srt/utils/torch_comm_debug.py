@@ -184,28 +184,21 @@ def _should_trace_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
     )
 
 
-def _sglang_stack(limit: int = 3) -> str:
-    """Return up to ``limit`` caller frames from SGLang source files.
+def _call_stack() -> str:
+    """Return all caller frames as ``filename:line`` entries.
 
-    Frames from torch, DeepEP and other dependencies are deliberately skipped.
-    The instrumentation implementation itself is also excluded, so the first
-    frame identifies the SGLang communication call site.
+    The instrumentation implementation itself is excluded.  Keeping every
+    other frame makes it possible to see transitions through torch, DeepEP and
+    application code while retaining a compact, path-independent format.
     """
     current_file = os.path.normcase(__file__)
     selected: list[str] = []
     for frame in reversed(traceback.extract_stack()[:-1]):
         filename = os.path.normcase(frame.filename)
-        if filename == current_file or not _is_sglang_file(filename):
+        if filename == current_file:
             continue
         selected.append(f"{os.path.basename(frame.filename)}:{frame.lineno}")
-        if len(selected) >= limit:
-            break
     return " <- ".join(selected) or "unavailable"
-
-
-def _is_sglang_file(filename: str) -> bool:
-    normalized = filename.replace("\\", "/")
-    return "/sglang/" in normalized or normalized.endswith("/sglang")
 
 
 def _arguments_summary(
@@ -268,7 +261,7 @@ def _wrap(
         details = _arguments_summary(
             args, kwargs, process_group_method=process_group_method
         )
-        stack = _sglang_stack() if _stack_logging_enabled() else None
+        stack = _call_stack() if _stack_logging_enabled() else None
         try:
             _log(op_name, "before", sequence, details, stack)
             # Log before synchronizing as well: if a previous NPU kernel is
@@ -313,7 +306,7 @@ def _wrap_deepep(
         # stores its process group internally; rank/world still come from the
         # default process group, which is the one used by the dispatcher.
         details = _arguments_summary(args if bound_method else args[1:], kwargs)
-        stack = _sglang_stack() if _stack_logging_enabled() else None
+        stack = _call_stack() if _stack_logging_enabled() else None
         try:
             _log(log_name, "before", sequence, details, stack)
             _sync_npu()
