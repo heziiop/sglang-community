@@ -60,7 +60,11 @@ try:
 except ImportError:
     use_deepep = False
 
-from sglang.srt.utils.torch_comm_debug import trace_deepep_call as _trace_deepep_call
+from sglang.srt.utils.torch_comm_debug import (
+    maybe_capture_deepep_mismatch,
+    record_deepep_snapshot,
+    trace_deepep_call as _trace_deepep_call,
+)
 
 if use_deepep and _is_npu and not _use_zbal:
     # Optional tracing for DeepEP's custom normal/low-latency communication
@@ -551,6 +555,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         previous_event = Buffer.capture() if self.async_finish else None
+        record_deepep_snapshot(
+            "deepep.normal.dispatch",
+            (hidden_states, topk_ids, topk_weights),
+            {},
+            dispatch_tokens=hidden_states.shape[0],
+            topk=topk_ids.shape[1],
+        )
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
@@ -649,6 +660,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
+        record_deepep_snapshot(
+            "deepep.normal.combine",
+            (hidden_states, topk_ids, topk_weights),
+            {},
+            combine_tokens=hidden_states.shape[0],
+        )
+        maybe_capture_deepep_mismatch(
+            group=get_tp_group().cpu_group,
+            is_extend_in_batch=get_is_extend_in_batch(),
+        )
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
@@ -714,6 +735,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        record_deepep_snapshot(
+            "deepep.low_latency.dispatch",
+            (hidden_states, topk_ids, topk_weights),
+            {},
+            dispatch_tokens=hidden_states.shape[0],
+            topk=topk_ids.shape[1],
+        )
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
@@ -821,6 +849,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        record_deepep_snapshot(
+            "deepep.low_latency.combine",
+            (hidden_states, topk_ids, topk_weights),
+            {},
+            combine_tokens=hidden_states.shape[0],
+        )
+        maybe_capture_deepep_mismatch(
+            group=get_tp_group().cpu_group,
+            is_extend_in_batch=get_is_extend_in_batch(),
+        )
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
