@@ -215,6 +215,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
         patch.object(parallel_state, "_WORLD", None),
         patch.object(parallel_state, "_TP", None),
         patch.object(parallel_state, "_MOE_EP", None),
+        patch.object(parallel_state, "_MOE_EP_LOW_LATENCY", None),
         patch.object(parallel_state, "_MOE_DP", None),
         patch.object(parallel_state, "_MOE_TP", None),
         patch.object(parallel_state, "_PP", None),
@@ -257,6 +258,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
                 expert_model_parallel_size=4,
                 pipeline_model_parallel_size=1,
                 moe_data_model_parallel_size=2,
+                duplicate_moe_ep_group=True,
             )
 
             # Verify TP groups
@@ -285,6 +287,13 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             assert (
                 moe_ep_groups == expected_moe_ep
             ), f"Wrong MOE_EP groups: {moe_ep_groups}"
+
+            # The low-latency DeepEP communicator must have identical membership
+            # and rank ordering while remaining a separately created group.
+            moe_ep_low_latency_groups = created_groups.get(
+                "moe_ep_low_latency", []
+            )
+            assert moe_ep_low_latency_groups == expected_moe_ep
 
             # Verify MOE_DP groups
             moe_dp_groups = created_groups.get("moe_dp", [])

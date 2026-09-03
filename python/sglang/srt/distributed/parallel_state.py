@@ -2022,6 +2022,7 @@ def get_dcp_group() -> GroupCoordinator:
 
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
+_MOE_EP_LOW_LATENCY: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
 
@@ -2033,6 +2034,13 @@ def get_moe_dp_group() -> GroupCoordinator:
 def get_moe_ep_group() -> GroupCoordinator:
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
     return _MOE_EP
+
+
+def get_moe_ep_low_latency_group() -> GroupCoordinator:
+    assert _MOE_EP_LOW_LATENCY is not None, (
+        "low-latency expert model parallel group is not initialized"
+    )
+    return _MOE_EP_LOW_LATENCY
 
 
 def get_moe_tp_group() -> GroupCoordinator:
@@ -2340,6 +2348,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    duplicate_moe_ep_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2610,31 +2619,49 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    moe_ep_group_ranks = []
+    for tp_group_idx in range(num_tensor_model_parallel_groups):
+        for moe_dp_idx in range(moe_dp_size):
+            for moe_tp_idx in range(moe_tp_size):
+                st = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + moe_dp_idx * moe_ep_size * moe_tp_size
+                    + moe_tp_idx
+                )
+                en = st + moe_ep_size * moe_tp_size
+                ranks = list(range(st, en, moe_tp_size))
+                moe_ep_group_ranks.append(ranks)
+
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
     # NPU requires a standalone group for MOE expert parallelism
     if moe_ep_size == tensor_model_parallel_size and not _is_npu:
         _MOE_EP = _TP
     else:
-        group_ranks = []
-        for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for moe_dp_idx in range(moe_dp_size):
-                for moe_tp_idx in range(moe_tp_size):
-                    st = (
-                        tp_group_idx * tensor_model_parallel_size
-                        + moe_dp_idx * moe_ep_size * moe_tp_size
-                        + moe_tp_idx
-                    )
-                    en = st + moe_ep_size * moe_tp_size
-                    ranks = list(range(st, en, moe_tp_size))
-                    group_ranks.append(ranks)
         _MOE_EP = init_model_parallel_group(
-            group_ranks,
+            moe_ep_group_ranks,
             get_world_group().local_rank,
             backend,
             use_pynccl=False,
             use_custom_allreduce=False,
             group_name="moe_ep",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    global _MOE_EP_LOW_LATENCY
+    assert _MOE_EP_LOW_LATENCY is None, (
+        "low-latency expert model parallel group is already initialized"
+    )
+    if duplicate_moe_ep_group:
+        _MOE_EP_LOW_LATENCY = init_model_parallel_group(
+            moe_ep_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="moe_ep_low_latency",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2934,6 +2961,11 @@ def destroy_model_parallel():
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
+
+    global _MOE_EP_LOW_LATENCY
+    if _MOE_EP_LOW_LATENCY:
+        _MOE_EP_LOW_LATENCY.destroy()
+    _MOE_EP_LOW_LATENCY = None
 
     global _MOE_TP
     if _MOE_TP:

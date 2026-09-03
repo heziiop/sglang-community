@@ -6,7 +6,10 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    get_moe_ep_low_latency_group,
+    get_tp_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -187,6 +190,8 @@ class DeepEPBuffer:
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
+                normal_buffer=None,
+                low_latency_buffer=None,
                 dispatch_mode=None,
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
@@ -206,8 +211,20 @@ class DeepEPBuffer:
         num_experts: int = -1,
     ):
         state = cls._state()
-        if state.buffer is not None:
-            return state.buffer
+        if deepep_mode == DeepEPMode.NORMAL:
+            buffer_attr = "normal_buffer"
+        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+            buffer_attr = "low_latency_buffer"
+        elif deepep_mode == DeepEPMode.AUTO:
+            # AUTO retains the original shared-buffer behavior. The NPU
+            # dispatcher passes an exact mode when dual communicators are used.
+            buffer_attr = "buffer"
+        else:
+            raise NotImplementedError
+
+        buffer = getattr(state, buffer_attr)
+        if buffer is not None:
+            return buffer
 
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
@@ -296,15 +313,38 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
-        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        return state.buffer
+        buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        setattr(state, buffer_attr, buffer)
+
+        if (
+            _is_npu
+            and state.normal_buffer is not None
+            and state.low_latency_buffer is not None
+        ):
+            normal_group_name = getattr(
+                state.normal_buffer, "moe_all_to_all_group_name", None
+            )
+            low_latency_group_name = getattr(
+                state.low_latency_buffer, "moe_all_to_all_group_name", None
+            )
+            if (
+                normal_group_name is not None
+                and low_latency_group_name is not None
+                and normal_group_name == low_latency_group_name
+            ):
+                raise RuntimeError(
+                    "NPU DeepEP normal and low-latency buffers resolved to the "
+                    "same HCCL communicator"
+                )
+        return buffer
 
     @classmethod
     def clean_buffer(cls):
         state = cls._state()
-        if not state.buffer.low_latency_mode:
+        buffer = state.low_latency_buffer or state.buffer
+        if buffer is None or not buffer.low_latency_mode:
             return
-        state.buffer.clean_low_latency_buffer(
+        buffer.clean_low_latency_buffer(
             state.num_max_dispatch_tokens_per_rank,
             state.hidden_size,
             state.num_experts,
@@ -897,29 +937,50 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        low_latency_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__()
 
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
-            group=group,
             router_topk=router_topk,
             permute_fusion=permute_fusion,
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             params_dtype=params_dtype,
-            deepep_mode=deepep_mode,
         )
+
+        use_separate_npu_buffers = _is_npu and self.deepep_mode.is_auto()
+        if use_separate_npu_buffers:
+            if low_latency_group is None:
+                low_latency_group = get_moe_ep_low_latency_group().device_group
+            if low_latency_group is group:
+                raise RuntimeError(
+                    "NPU DeepEP AUTO mode requires distinct normal and low-latency "
+                    "process groups"
+                )
+        else:
+            low_latency_group = group
 
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                group=low_latency_group,
+                deepep_mode=(
+                    DeepEPMode.LOW_LATENCY
+                    if use_separate_npu_buffers
+                    else deepep_mode
+                ),
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
+                group=group,
+                deepep_mode=(
+                    DeepEPMode.NORMAL if use_separate_npu_buffers else deepep_mode
+                ),
                 async_finish=async_finish,
                 **common_kwargs,
             )

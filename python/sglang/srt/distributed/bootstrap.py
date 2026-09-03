@@ -263,6 +263,11 @@ def _init_parallel_groups(
             and server_args.enable_two_batch_overlap
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
+        duplicate_moe_ep_group=(
+            is_npu()
+            and get_exec().moe.moe_a2a_backend == "deepep"
+            and server_args.deepep_mode == "auto"
+        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
