@@ -58,6 +58,7 @@ class Issue:
 @dataclass
 class RankReport:
     rank: str
+    process_ids: list[int] = field(default_factory=list)
     records: int = 0
     calls: int = 0
     completed: int = 0
@@ -124,12 +125,22 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
     reports: dict[str, RankReport] = {}
     for rank, records in records_by_rank.items():
         report = RankReport(rank=rank, records=len(records))
-        pending: dict[int, Record] = {}
-        seen_phase: set[tuple[int, str]] = set()
-        previous_seq: int | None = None
+        process_ids = sorted({record.pid for record in records if record.pid is not None})
+        report.process_ids = process_ids
+        if len(process_ids) > 1:
+            _issue(
+                report,
+                "multiple_processes_same_rank",
+                f"rank contains multiple pids: {','.join(map(str, process_ids))}; "
+                "operation order comparison may be ambiguous",
+            )
+        # ``seq`` is process-local, so pid is part of the call identity.
+        pending: dict[tuple[int | None, int], Record] = {}
+        seen_phase: set[tuple[int | None, int, str]] = set()
+        previous_seq_by_pid: dict[int | None, int] = {}
 
         for record in records:
-            phase_key = (record.seq, record.phase)
+            phase_key = (record.pid, record.seq, record.phase)
             if phase_key in seen_phase:
                 _issue(
                     report,
@@ -139,6 +150,7 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
                 )
             seen_phase.add(phase_key)
 
+            previous_seq = previous_seq_by_pid.get(record.pid)
             if previous_seq is not None and record.seq < previous_seq:
                 _issue(
                     report,
@@ -146,12 +158,13 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
                     f"sequence decreased from {previous_seq} to {record.seq}",
                     record,
                 )
-            previous_seq = record.seq
+            previous_seq_by_pid[record.pid] = record.seq
 
             if record.phase == "before":
                 report.calls += 1
                 report.operations.append(record.op)
-                if record.seq in pending:
+                call_key = (record.pid, record.seq)
+                if call_key in pending:
                     _issue(
                         report,
                         "duplicate_before",
@@ -159,10 +172,11 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
                         f"{pending[record.seq].op}, current op={record.op}",
                         record,
                     )
-                pending[record.seq] = record
+                pending[call_key] = record
                 continue
 
-            start = pending.get(record.seq)
+            call_key = (record.pid, record.seq)
+            start = pending.get(call_key)
             if start is None:
                 _issue(
                     report,
@@ -179,7 +193,7 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
                     f"seq={record.seq} started as {start.op} but ended as {record.op}",
                     record,
                 )
-            del pending[record.seq]
+            del pending[call_key]
             if record.phase == "after":
                 report.completed += 1
             else:
