@@ -8,7 +8,9 @@ Examples::
     cat rank0.log rank1.log | python -m sglang.srt.utils.parse_torch_comm_debug -
 
 The parser compares the ordered communication operation stream for every rank
-and reports calls that did not reach ``after`` (or ended in ``error``).
+and reports calls that did not reach ``after`` (or ended in ``error``).  The
+``seq`` field is process-local: it is used only to pair phases within one pid,
+never to compare sequence numbers across ranks.
 """
 
 from __future__ import annotations
@@ -240,7 +242,7 @@ def _build_reports(records_by_rank: dict[str, list[Record]]) -> dict[str, RankRe
                         report,
                         "duplicate_before",
                         f"second before for seq={record.seq}; previous op="
-                        f"{pending[record.seq].op}, current op={record.op}",
+                        f"{pending[call_key].op}, current op={record.op}",
                         record,
                     )
                 pending[call_key] = record
