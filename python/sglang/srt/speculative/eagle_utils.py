@@ -755,8 +755,8 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
-        if _is_hip:
-            # On ROCm, the per-rank draft tokens can differ, so ranks accept a
+        if _is_hip or _is_npu:
+            # On ROCm/NPU, the per-rank draft tokens can differ, so ranks accept a
             # different number of drafts, desynchronize the committed seq_lens, and
             # deadlock the next TP collective. Broadcast from rank 0 to ensure
             # consistency, the same way the sampling branch below does.

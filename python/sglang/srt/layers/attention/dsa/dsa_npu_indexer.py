@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
@@ -12,6 +13,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.custom_op import register_custom_op
 
 if is_npu():
     import torch_npu
@@ -19,6 +21,21 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _broadcast_npu_dsa_topk_impl(topk_indices: torch.Tensor) -> None:
+    """Make native NPU indexer output identical across attention-TP ranks."""
+    group = get_attn_tp_group()
+    if group.world_size > 1:
+        group.broadcast(topk_indices, src=0)
+
+
+if is_npu():
+    _broadcast_npu_dsa_topk = register_custom_op(
+        mutates_args=["topk_indices"]
+    )(_broadcast_npu_dsa_topk_impl)
+else:
+    _broadcast_npu_dsa_topk = _broadcast_npu_dsa_topk_impl
 
 
 class DSANPUIndexerMixin:
@@ -272,6 +289,7 @@ class DSANPUIndexerMixin:
                 actual_seq_lengths_kv,
                 block_table,
             )
+            _broadcast_npu_dsa_topk(topk_indices)
             return topk_indices
         else:
             block_table = (
@@ -295,7 +313,9 @@ class DSANPUIndexerMixin:
                 sparse_mode=3,
             )
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            topk_indices = topk_indices[0].squeeze(1)
+            _broadcast_npu_dsa_topk(topk_indices)
+            return topk_indices
 
     def do_npu_cp_balance_indexer(
         self,
