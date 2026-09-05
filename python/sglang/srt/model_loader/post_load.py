@@ -56,6 +56,18 @@ def _same_staged_data(current: torch.Tensor, staged: torch.Tensor) -> bool:
     )
 
 
+def _storage_can_hold_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether the tensor's storage still backs its full view.
+
+    Post-load hooks may deliberately release a temporary tensor's storage (for
+    example with ``untyped_storage().resize_(0)``) after deriving replacement
+    weights.  Such a tensor cannot be used as the source of a restore copy.
+    """
+    return tensor.untyped_storage().nbytes() >= (
+        tensor.numel() * tensor.element_size()
+    )
+
+
 def _copy_data_to_device(
     data: torch.Tensor,
     device: torch.device,
@@ -88,15 +100,21 @@ def _restore_tensor(
     if tensor.is_meta:
         raise RuntimeError("Post-load processing produced a meta tensor")
 
-    if (
-        original_state is not None
-        and tensor is original_state.tensor
-        and original_state.staged_data is not None
-        and _same_staged_data(tensor.data, original_state.staged_data)
-    ):
-        original_state.original_data.copy_(tensor.data)
-        tensor.data = original_state.original_data
-        return
+    if original_state is not None and tensor is original_state.tensor:
+        if (
+            original_state.staged_data is not None
+            and _storage_can_hold_tensor(tensor.data)
+            and _same_staged_data(tensor.data, original_state.staged_data)
+        ):
+            original_state.original_data.copy_(tensor.data)
+            tensor.data = original_state.original_data
+            return
+        # The hook may have released the staged storage after materializing
+        # derived weights.  Restore the original backing tensor without
+        # copying from the now-invalid staged view.
+        if not _storage_can_hold_tensor(tensor.data):
+            tensor.data = original_state.original_data
+            return
 
     tensor.data = _copy_data_to_device(
         tensor.data,
