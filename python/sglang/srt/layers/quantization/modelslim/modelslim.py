@@ -609,9 +609,15 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
+        w13_weight = (
+            layer.w13_weight_fused
+            if hasattr(layer, "w13_weight_fused")
+            else layer.w13_weight
+        )
         quant_info = AscendQuantInfo(
-            w13_weight=layer.w13_weight,
+            w13_weight=w13_weight,
             w2_weight=layer.w2_weight,
+            w13_weight_fused=getattr(layer, "w13_weight_fused", None),
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
             w13_weight_offset=getattr(layer, "w13_weight_offset", None),

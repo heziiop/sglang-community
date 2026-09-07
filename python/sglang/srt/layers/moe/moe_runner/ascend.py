@@ -236,6 +236,10 @@ class AscendQuantInfo(MoeQuantInfo):
 
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
+    # Native CANN fused W4A8 GMM/SwiGLU consumes a quint4x2 tensor whose view
+    # keeps the logical [E, K, N] shape. vLLM's custom wrapper supplies this
+    # metadata itself, while the native torch.ops.npu path needs it explicitly.
+    w13_weight_fused: Optional[torch.Tensor] = None
     w13_weight_scale: Optional[torch.Tensor] = None
     w2_weight_scale: Optional[torch.Tensor] = None
     w13_weight_offset: Optional[torch.Tensor] = None

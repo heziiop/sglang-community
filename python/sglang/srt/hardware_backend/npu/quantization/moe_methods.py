@@ -658,6 +658,21 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Process weight
         weight = getattr(layer, f"{weight_prefix}_weight")
+        if (
+            self.new_quant_version
+            and self.is_per_channel_weight
+            and not self.activation_use_clip
+            and weight_prefix == "w13"
+        ):
+            # The native CANN op derives its output shape from the weight view.
+            # Keep a logical [E, K, N] quint4x2 copy for fused GMM/SwiGLU;
+            # the regular path below still uses vLLM-compatible int32 packing.
+            layer.w13_weight_fused = torch.nn.Parameter(
+                self._pack_new_weight_for_fused(weight.data), requires_grad=False
+            )
+            # This ModelSlim path always uses the native fused W13 kernel, so
+            # the vLLM-compatible int32 copy is not retained.
+            delattr(layer, "w13_weight")
         weight.data = weight.data.transpose(1, 2).contiguous()
         weight.data = npu_format_cast(weight.data)
         weight.data = self._pack_to_int32(weight.data)
@@ -747,6 +762,28 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             weight.to(torch.float32), scale, None, torch.quint4x2, -1, False
         )
 
+    @staticmethod
+    def _pack_new_weight_for_fused(weight: torch.Tensor) -> torch.Tensor:
+        """Restore v1.0.0 output channels for CANN's native fused op.
+
+        ModelSlim 1.0.0 stores two signed int4 values in each int8 row.  The
+        native operator requires a quint4x2 tensor with the logical, unpacked
+        view shape, unlike vLLM's custom wrapper which patches that view from
+        ``weight_scale``.
+        """
+        import torch_npu
+
+        packed = weight.to(torch.int16)
+        low = (packed & 0x0F).to(torch.int8) - 8
+        high = ((packed >> 4) & 0x0F).to(torch.int8) - 8
+        unpacked = torch.cat((low, high), dim=1)
+        unpacked = unpacked.transpose(1, 2).contiguous()
+        unpacked = npu_format_cast(unpacked)
+        scale = torch.ones(1, dtype=torch.float32, device=unpacked.device)
+        return torch_npu.npu_quantize(
+            unpacked.to(torch.float32), scale, None, torch.quint4x2, -1, False
+        )
+
     def apply(
         self,
         quant_info: "AscendQuantInfo",
@@ -803,6 +840,9 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         # like its weight and scale arguments.
         scale_bias = getattr(quant_info, "w13_scale_bias", None)
         weight_scale = quant_info.w13_weight_scale
+        fused_weight = getattr(quant_info, "w13_weight_fused", None)
+        if fused_weight is None:
+            fused_weight = quant_info.w13_weight
         if scale_bias is None or weight_scale is None:
             raise RuntimeError(
                 "W4A8 fused GMM/SwiGLU requires both w13_weight_scale and "
@@ -814,10 +854,21 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                 f"w13_weight_scale to have the same [E, N] shape, got "
                 f"{tuple(scale_bias.shape)} and {tuple(weight_scale.shape)}."
             )
+        if fused_weight.ndim < 3 or fused_weight.shape[0] != weight_scale.shape[0]:
+            raise RuntimeError(
+                "W4A8 fused GMM/SwiGLU expects an expert weight with "
+                f"first dimension {weight_scale.shape[0]}, got {tuple(fused_weight.shape)}."
+            )
+        if fused_weight.ndim == 3 and fused_weight.shape[-1] != weight_scale.shape[-1]:
+            raise RuntimeError(
+                "W4A8 fused GMM/SwiGLU expects the weight logical N dimension "
+                f"to equal weight_scale.shape[-1]={weight_scale.shape[-1]}, "
+                f"got {fused_weight.shape[-1]}."
+            )
         weight_assist_matrix = [scale_bias]
         return torch.ops.npu.npu_grouped_matmul_swiglu_quant_v2(
             x=hidden_states,
-            weight=[quant_info.w13_weight],
+            weight=[fused_weight],
             weight_scale=[weight_scale],
             x_scale=pertoken_scale,
             group_list=expert_tokens,
