@@ -619,10 +619,16 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                 scale_second,
                 self.is_per_channel_weight,
             )
+            # Per-channel scales are laid out as [E, 1, N] after the
+            # transpose/reinterpret step; the fused GMM/SwiGLU op requires
+            # the 2-D [E, N] form. Per-group scales keep their group axis.
+            scale_squeeze_dim = 1 if self.is_per_channel_weight else -1
             setattr(
                 layer,
                 f"{weight_prefix}_weight_scale",
-                torch.nn.Parameter(processed_scale.squeeze(-1), requires_grad=False),
+                torch.nn.Parameter(
+                    processed_scale.squeeze(scale_squeeze_dim), requires_grad=False
+                ),
             )
             if scale_second is not None:
                 delattr(layer, f"{weight_prefix}_weight_scale_second")
