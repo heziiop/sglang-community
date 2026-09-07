@@ -739,28 +739,41 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             **scale_args,
         )
 
-    def apply_gmm1_int32(
+    def apply_gmm1_swiglu_quant(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        group_list_type,
-    ) -> torch.Tensor:
-        """Run W13 without dequantizing; dequant_swiglu_quant consumes it.
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type: int,
+        swiglu_limit: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse routed W4A8 GMM1, SwiGLU and requantisation.
 
-        The fused Ascend SwiGLU path expects the INT32 accumulation from GMM1
-        together with the W13 and activation scales.  Keep the scales out of
-        GMM1 so that dequant_swiglu_quant performs the dequantization exactly
-        once.
+        This is the same per-channel routed-expert path used by vLLM Ascend's
+        ``grouped_matmul_swiglu_quant_v2``.  The fused op consumes the
+        dispatch count/cumulative representation together with its type, so
+        unlike ``dequant_swiglu_quant`` no separate ``group_index`` conversion
+        is needed here.
         """
-        return self.matmul.forward(
-            quant_info,
-            "w13",
-            hidden_states,
-            expert_tokens,
-            torch.int32,
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
+                hidden_states
+            )
+
+        # vLLM passes the expert assist matrix as one tensor (weights/scales
+        # themselves remain one-element lists for the grouped-matmul ABI).
+        weight_assist_matrix = getattr(quant_info, "w13_scale_bias", None)
+        return torch.ops.npu.npu_grouped_matmul_swiglu_quant_v2(
+            x=hidden_states,
+            weight=[quant_info.w13_weight],
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            group_list=expert_tokens,
+            weight_assist_matrix=weight_assist_matrix,
+            dequant_mode=0,
             group_list_type=group_list_type,
-            transposed=True,
+            swiglu_limit=swiglu_limit or 0.0,
         )
 
 

@@ -338,6 +338,130 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         )
 
 
+class NPUW4A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+    """ModelSlim W4A8 linear method used by the un-fused shared expert.
+
+    The per-channel layout is consumed by the same chain as vLLM Ascend's
+    shared expert: dynamic INT8 activation quantization, INT32 matmul, and a
+    caller-controlled SwiGLU/dequant step.  Per-group weights retain the
+    regular weight-quantized matmul fallback.
+    """
+
+    def __init__(
+        self, quant_config=None, group_size: int = 0, new_quant_version: bool = False
+    ):
+        super().__init__(quant_config)
+        self.group_size = group_size
+        self.new_quant_version = new_quant_version
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        weight = layer.weight.data.transpose(0, 1).contiguous()
+        layer.weight_scale.data = layer.weight_scale.data.flatten().to(torch.float32)
+        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        if hasattr(layer, "weight_offset"):
+            layer.weight_offset.data = layer.weight_offset.data.flatten()
+
+        if self.group_size > 0:
+            second = layer.weight_scale_second.data.transpose(0, 1).contiguous()
+            # npu_weight_quant_batchmatmul consumes the combined per-group
+            # dequant scale in [input/group, output] layout.
+            combined = (
+                second.to(torch.float32)
+                * layer.weight_scale.data.reshape(1, -1)
+            ).contiguous()
+            layer.weight_scale_second = torch.nn.Parameter(
+                combined, requires_grad=False
+            )
+            delattr(layer, "weight_offset_second")
+
+        if self.new_quant_version:
+            assert weight.shape[-1] % 4 == 0, (
+                "packed W4A8 weight output dimension must be divisible by 8"
+            )
+            layer.weight.data = weight.view(torch.int32).contiguous()
+        else:
+            layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
+                weight.to(torch.int32)
+            )
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias=None):
+        original_dtype = x.dtype
+        if self.group_size > 0:
+            return torch.ops.npu.npu_weight_quant_batchmatmul(
+                x,
+                layer.weight,
+                antiquant_scale=layer.weight_scale_second.to(x.dtype),
+                antiquant_group_size=self.group_size,
+            )
+
+        quantized_x, pertoken_scale = torch.ops.npu.npu_dynamic_quant(x)
+        return torch.ops.npu.npu_quant_matmul(
+            quantized_x,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=pertoken_scale.flatten(),
+            bias=bias,
+            output_dtype=original_dtype,
+        )
+
+    def apply_shared_expert(
+        self,
+        gate_up_layer: torch.nn.Module,
+        down_layer: torch.nn.Module,
+        x: torch.Tensor,
+        swiglu_limit=None,
+    ):
+        """Run vLLM Ascend's quantized shared-expert chain."""
+        if (
+            self.group_size > 0
+            or not hasattr(gate_up_layer, "weight_scale")
+            or not hasattr(down_layer, "weight_scale")
+        ):
+            return None
+
+        original_dtype = x.dtype
+        quantized_x, pertoken_scale = torch.ops.npu.npu_dynamic_quant(x)
+        gate_up = torch.ops.npu.npu_quant_matmul(
+            quantized_x,
+            gate_up_layer.weight,
+            gate_up_layer.weight_scale,
+            pertoken_scale=None,
+            bias=None,
+            output_dtype=torch.int32,
+        )
+
+        clamp_limit = float(swiglu_limit or 0.0)
+        group_index = None
+        if clamp_limit <= 0.0:
+            group_index = torch.empty(
+                (1,), dtype=torch.int64, device=gate_up.device
+            )
+            group_index.fill_(gate_up.shape[0])
+        swiglu_out, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            x=gate_up,
+            weight_scale=getattr(
+                gate_up_layer, "weight_scale_fp32", gate_up_layer.weight_scale
+            ),
+            activation_scale=pertoken_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=group_index,
+            activate_left=True,
+            quant_mode=1,
+            swiglu_mode=1,
+            clamp_limit=clamp_limit,
+        )
+        return torch.ops.npu.npu_quant_matmul(
+            swiglu_out,
+            down_layer.weight,
+            down_layer.weight_scale,
+            pertoken_scale=swiglu_out_scale,
+            bias=None,
+            output_dtype=original_dtype,
+        )
+
+
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
     """NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
 

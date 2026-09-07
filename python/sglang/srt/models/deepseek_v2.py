@@ -345,6 +345,25 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
+        # Match vLLM Ascend's W4A8 shared-expert path.  The linear quant
+        # method owns the exact packed-weight contract and returns None when
+        # the checkpoint uses a non-fused layout (for example per-group W4A8).
+        if gateup_pre_quant is None:
+            apply_shared = getattr(
+                getattr(self.gate_up_proj, "quant_method", None),
+                "apply_shared_expert",
+                None,
+            )
+            if apply_shared is not None:
+                shared_out = apply_shared(
+                    self.gate_up_proj,
+                    self.down_proj,
+                    x,
+                    self.swiglu_limit,
+                )
+                if shared_out is not None:
+                    return shared_out
+
         if gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing

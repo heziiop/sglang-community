@@ -15,7 +15,6 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
     NPUSwigluQuant,
-    NPUSwigluQuantWithScales,
     NPUSwigluStepAndMul,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
@@ -111,14 +110,6 @@ class AscendRunnerCore(MoeRunnerCore):
                     ),
                     linear_beta=config.gemm1_clamp_limit,
                 )
-            elif (
-                isinstance(kernel, NPUW4A8Int8MoEMethod)
-                and config.gemm1_alpha is None
-                and config.gemm1_clamp_limit is None
-            ):
-                # DeepEP W4A8 uses the fused Ascend contract:
-                # GMM1(INT32) -> dequant_swiglu_quant -> GMM2(INT8).
-                self.activation = NPUSwigluQuantWithScales()
             else:
                 self.activation = NPUSwigluDeepEPKernel(
                     need_quant=is_quant_kernel,
@@ -181,35 +172,24 @@ class AscendRunnerCore(MoeRunnerCore):
             )
         else:
             # --- w13 (gate & up) projection + activation ---
-            # With INT8 DeepEP dispatch, keep GMM1's INT32 accumulation and
-            # let dequant_swiglu_quant consume both scales.  BF16 dispatch is
-            # retained as a compatibility fallback for explicit overrides.
+            # Match vLLM Ascend's routed W4A8 path: for per-channel weights,
+            # fuse GMM1, SwiGLU and requantisation in one kernel. Per-group
+            # weights stay on the regular GMM + activation path.
             use_fused_w4a8_swiglu = (
                 isinstance(w13_kernel, NPUW4A8Int8MoEMethod)
-                and isinstance(self.activation, NPUSwigluQuantWithScales)
+                and w13_kernel.is_per_channel_weight
+                and isinstance(self.activation, NPUSwigluDeepEPKernel)
                 and runner_input.hidden_states_scale is not None
+                and self.config.gemm1_alpha is None
             )
             if use_fused_w4a8_swiglu:
-                hidden_states = w13_kernel.apply_gmm1_int32(
+                hidden_states, pertoken_scale = w13_kernel.apply_gmm1_swiglu_quant(
                     quant_info,
                     x,
                     expert_tokens,
+                    pertoken_scale=runner_input.hidden_states_scale,
                     group_list_type=group_list_type,
-                )
-                # dequant_swiglu_quant consumes per-expert token counts.  The
-                # grouped matmul accepts either counts (type 1) or cumulative
-                # ends (type 0), so normalize the latter like vLLM Ascend.
-                group_index = expert_tokens
-                if group_list_type == 0:
-                    group_index = torch.cat(
-                        [expert_tokens[:1], torch.diff(expert_tokens)], dim=0
-                    )
-                hidden_states, pertoken_scale = self.activation._apply_activation(
-                    hidden_states,
-                    weight_scale=quant_info.w13_weight_scale,
-                    activation_scale=runner_input.hidden_states_scale,
-                    group_index=group_index,
-                    bias=None,
+                    swiglu_limit=self.config.gemm1_clamp_limit,
                 )
             else:
                 hidden_states = w13_kernel.apply(
@@ -227,12 +207,6 @@ class AscendRunnerCore(MoeRunnerCore):
                         hidden_states,
                         group_list=expert_tokens,
                         group_list_type=group_list_type,
-                    )
-                elif isinstance(self.activation, NPUSwigluQuantWithScales):
-                    # BF16 dispatch has no activation scale; use the same
-                    # scale-free op as the Ascend-TP W4A8 path.
-                    hidden_states, pertoken_scale = NPUSwigluQuant()._apply_activation(
-                        hidden_states
                     )
                 else:
                     hidden_states, pertoken_scale = self.activation._apply_activation(

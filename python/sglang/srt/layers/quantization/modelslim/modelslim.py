@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A4MXFP4MoE,
     ModelSlimW4A8Int8MoE,
+    ModelSlimW4A8Int8,
     ModelSlimW4A8MXFP4MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
@@ -310,6 +311,7 @@ class ModelSlimConfig(QuantizationConfig):
 
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
+            ("W4A8_DYNAMIC", ModelSlimW4A8Int8),
             ("W8A8", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
             ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
@@ -521,6 +523,24 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
+
+    def apply_shared_expert(
+        self,
+        gate_up_layer: torch.nn.Module,
+        down_layer: torch.nn.Module,
+        x: torch.Tensor,
+        swiglu_limit=None,
+    ):
+        kernel = getattr(getattr(gate_up_layer, "scheme", None), "kernel", None)
+        apply_shared = getattr(kernel, "apply_shared_expert", None)
+        down_kernel = getattr(
+            getattr(getattr(down_layer, "scheme", None), "kernel", None),
+            "apply_shared_expert",
+            None,
+        )
+        if apply_shared is None or down_kernel is None:
+            return None
+        return apply_shared(gate_up_layer, down_layer, x, swiglu_limit)
 
 
 class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
