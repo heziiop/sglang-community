@@ -774,7 +774,6 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             weight_assist_matrix=weight_assist_matrix,
             dequant_mode=0,
             group_list_type=group_list_type,
-            swiglu_limit=swiglu_limit or 0.0,
         )
 
 
