@@ -585,6 +585,10 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
     """W4A8 MoE – weights are int4, activations quantized to int8."""
 
+    # npu_moe_gating_top_k applies routed_scaling_factor after renorm, folding it
+    # into topk_weights; forward_deepep skips the post-combine multiply on this flag.
+    fuse_routed_scaling_factor_in_topk = True
+
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
