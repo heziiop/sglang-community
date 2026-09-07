@@ -739,6 +739,30 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             **scale_args,
         )
 
+    def apply_gmm1_int32(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type,
+    ) -> torch.Tensor:
+        """Run W13 without dequantizing; dequant_swiglu_quant consumes it.
+
+        The fused Ascend SwiGLU path expects the INT32 accumulation from GMM1
+        together with the W13 and activation scales.  Keep the scales out of
+        GMM1 so that dequant_swiglu_quant performs the dequantization exactly
+        once.
+        """
+        return self.matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            torch.int32,
+            group_list_type=group_list_type,
+            transposed=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 #  NPUWNA16Int4MoEMethod

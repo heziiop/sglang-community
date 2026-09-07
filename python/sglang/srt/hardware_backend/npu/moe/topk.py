@@ -87,21 +87,23 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
+        # Match vLLM Ascend's wrapper: the underlying kernel is always called
+        # with renorm disabled.  Only softmax weights are renormalized in
+        # Python afterwards; sigmoid routing keeps the kernel's selected
+        # weights unchanged.
+        norm_type = 0 if topk_config.scoring_func == "softmax" else 1
+        if correction_bias is not None and correction_bias.dtype != router_logits.dtype:
+            correction_bias = correction_bias.to(router_logits.dtype)
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
+            router_logits,
             k=topk_config.top_k,
-            bias=(
-                correction_bias.to(torch.float32)
-                if correction_bias is not None
-                else None
-            ),
+            bias=(correction_bias if correction_bias is not None else None),
             # num_expert_group and topk_group in some topk_config without group is None, (not supported by this ops)
             k_group=topk_config.topk_group if use_grouped_topk else 1,
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
-            renorm=renormalize,
-            # 1 for sigmoid, 0 for softmax
-            norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
+            renorm=0,
+            norm_type=norm_type,
             routed_scaling_factor=(
                 topk_config.routed_scaling_factor
                 if topk_config.apply_routed_scaling_factor_on_output
@@ -109,6 +111,8 @@ def fused_topk_npu(
             ),
             eps=float(1e-20),
         )
+        if norm_type == 0 and renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.to(torch.float32)
 
     # torch native is not yet supported num_token_non_padded
