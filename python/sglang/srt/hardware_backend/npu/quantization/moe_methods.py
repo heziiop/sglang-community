@@ -761,9 +761,10 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                 hidden_states
             )
 
-        # vLLM passes the expert assist matrix as one tensor (weights/scales
-        # themselves remain one-element lists for the grouped-matmul ABI).
-        weight_assist_matrix = getattr(quant_info, "w13_scale_bias", None)
+        # The fused op uses a list-of-tensors ABI for the assist matrix, just
+        # like its weight and scale arguments.
+        scale_bias = getattr(quant_info, "w13_scale_bias", None)
+        weight_assist_matrix = [scale_bias] if scale_bias is not None else []
         return torch.ops.npu.npu_grouped_matmul_swiglu_quant_v2(
             x=hidden_states,
             weight=[quant_info.w13_weight],
