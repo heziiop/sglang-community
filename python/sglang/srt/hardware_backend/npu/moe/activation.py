@@ -39,6 +39,16 @@ class NPUSwigluQuant(BaseActivation):
         return hidden_states, swiglu_out_scale
 
 
+class NPUSwigluThenQuant(BaseActivation):
+    """Run SwiGLU and per-token INT8 quantization as separate NPU ops."""
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        import torch_npu
+
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+        return torch_npu.npu_dynamic_quant(hidden_states, dst_type=torch.int8)
+
+
 class NPUSwigluQuantWithScales(BaseActivation):
     def _apply_activation(
         self,
@@ -230,6 +240,7 @@ def get_swiglu_variant(method: str, **kwargs: Any) -> BaseActivation:
     variants: dict[str, type[BaseActivation]] = {
         "standard": NPUSwiglu,
         "dequant_swiglu_quant": NPUSwigluQuant,
+        "swiglu_then_quant": NPUSwigluThenQuant,
         "dequant_swiglu_quant_with_scales": NPUSwigluQuantWithScales,
         "swiglu_quant_deepep_kernel": NPUSwigluDeepEPKernel,
         "gelu_and_mul": NPUGeluAndMul,

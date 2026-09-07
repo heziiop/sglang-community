@@ -49,6 +49,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         self.kernel = NPUW4A8Int8MoEMethod(
             is_per_channel_weight=self.is_per_channel_weight,
             activation_use_clip=self.activation_use_clip,
+            use_separate_swiglu_quant=True,
         )
 
     def create_weights(

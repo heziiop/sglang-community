@@ -594,10 +594,12 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
         is_per_channel_weight: bool = False,
         activation_use_clip: bool = False,
+        use_separate_swiglu_quant: bool = False,
     ):
         super().__init__(quant_config)
         self.is_per_channel_weight = is_per_channel_weight
         self.activation_use_clip = activation_use_clip
+        self.use_separate_swiglu_quant = use_separate_swiglu_quant
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 

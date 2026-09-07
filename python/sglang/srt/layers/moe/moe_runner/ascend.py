@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
+    NPUSwigluThenQuant,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
@@ -110,6 +111,13 @@ class AscendRunnerCore(MoeRunnerCore):
                     ),
                     linear_beta=config.gemm1_clamp_limit,
                 )
+            elif isinstance(kernel, NPUW4A8Int8MoEMethod) and getattr(
+                kernel, "use_separate_swiglu_quant", False
+            ):
+                # ModelSlim W4A8 DeepEP: GMM1 already emits floating-point
+                # activations. Keep SwiGLU and INT8 per-token quantization as
+                # two torch_npu calls instead of using swiglu_quant fusion.
+                self.activation = NPUSwigluThenQuant()
             else:
                 self.activation = NPUSwigluDeepEPKernel(
                     need_quant=is_quant_kernel,
