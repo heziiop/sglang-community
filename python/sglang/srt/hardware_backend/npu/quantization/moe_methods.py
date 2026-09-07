@@ -594,10 +594,12 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
         is_per_channel_weight: bool = False,
         activation_use_clip: bool = False,
+        new_quant_version: bool = True,
     ):
         super().__init__(quant_config)
         self.is_per_channel_weight = is_per_channel_weight
         self.activation_use_clip = activation_use_clip
+        self.new_quant_version = new_quant_version
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
@@ -614,7 +616,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         if not self.activation_use_clip:
             # Process scale according to per-channel or per-group
             processed_scale = self._process_scale(
-                getattr(layer, f"{weight_prefix}_weight"),
+                getattr(layer, f"{weight_prefix}_weight").transpose(1, 2).contiguous(),
                 scale,
                 scale_second,
                 self.is_per_channel_weight,
@@ -623,6 +625,9 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             # transpose/reinterpret step; the fused GMM/SwiGLU op requires
             # the 2-D [E, N] form. Per-group scales keep their group axis.
             scale_squeeze_dim = 1 if self.is_per_channel_weight else -1
+            # Build/normalize the assist matrix while the original
+            # [E, N, 1] scale is still available.
+            self._update_bias(layer, weight_prefix)
             setattr(
                 layer,
                 f"{weight_prefix}_weight_scale",
@@ -633,7 +638,6 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             if scale_second is not None:
                 delattr(layer, f"{weight_prefix}_weight_scale_second")
                 delattr(layer, f"{weight_prefix}_weight_offset_second")
-            self._update_bias(layer, weight_prefix)
         else:
             # With clip: simple squeeze + unsqueeze
             processed_scale = scale.data.squeeze(-1).unsqueeze(1).contiguous()
@@ -668,6 +672,23 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         weight_prefix: str,
     ) -> None:
         scale_bias_name = f"{weight_prefix}_scale_bias"
+        # v1.0.0 checkpoints carry the fused bias offline. Older ModelSlim
+        # checkpoints do not; derive the A8W4 assist matrix exactly as vLLM
+        # does from the transposed int4 values and per-channel scale.
+        if not getattr(layer, "_modelslim_w4a8_new_quant", False):
+            weight = getattr(layer, f"{weight_prefix}_weight").data
+            scale = getattr(layer, f"{weight_prefix}_weight_scale").data
+            if scale.ndim == 3 and scale.shape[-1] == 1:
+                weight_t = weight.transpose(1, 2).contiguous().to(torch.float32)
+                scale_t = scale.transpose(1, 2).contiguous().to(torch.float32)
+                if weight_t.shape[-1] == scale_t.shape[-1]:
+                    bias = 8 * (weight_t * scale_t).sum(dim=1)
+                    setattr(
+                        layer,
+                        scale_bias_name,
+                        torch.nn.Parameter(bias, requires_grad=False),
+                    )
+                    return
         if hasattr(layer, scale_bias_name):
             scale_bias = getattr(layer, scale_bias_name)
             scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
@@ -689,7 +710,9 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         # Per‑group: multiply channel and group scales, then pack into uint64
         per_group_scale = per_group_scale.transpose(1, 2).contiguous()
         group_num, k, n = weight.shape
-        n = n * 2  # packed weight halves the column dimension
+        if self.new_quant_version:
+            # v1.0.0 stores two output channels in each int8 weight element.
+            n = n * 2
         per_group_scale = per_group_scale.reshape(group_num, -1, n)
         group_num, quantgroup_num, n = per_group_scale.shape
 
@@ -706,12 +729,23 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         return sscale_uint64_tensor
 
     def _pack_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
-        # pack 4 int8 (representing 8 int4) into int32
-        assert weight.shape[-1] % 4 == 0, (
-            f"Last dimension of weight must be divisible by 4 for int8→int32 packing, "
-            f"got shape {weight.shape}"
+        if self.new_quant_version:
+            # v1.0.0 weights already contain two packed int4 values per int8.
+            assert weight.shape[-1] % 4 == 0, (
+                f"Last dimension of weight must be divisible by 4 for int8→int32 packing, "
+                f"got shape {weight.shape}"
+            )
+            return weight.view(torch.int32).contiguous()
+
+        # Older ModelSlim exports contain one signed int4 value per int8.  Use
+        # the same quint4x2 conversion as vLLM so the operator sees the
+        # logical N dimension rather than an extra 4x shrink from view(int32).
+        import torch_npu
+
+        scale = torch.ones(1, dtype=torch.float32, device=weight.device)
+        return torch_npu.npu_quantize(
+            weight.to(torch.float32), scale, None, torch.quint4x2, -1, False
         )
-        return weight.view(torch.int32).contiguous()
 
     def apply(
         self,
@@ -763,18 +797,28 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         is needed here.
         """
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer(
-                hidden_states
-            )
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
 
         # The fused op uses a list-of-tensors ABI for the assist matrix, just
         # like its weight and scale arguments.
         scale_bias = getattr(quant_info, "w13_scale_bias", None)
-        weight_assist_matrix = [scale_bias] if scale_bias is not None else []
+        weight_scale = quant_info.w13_weight_scale
+        if scale_bias is None or weight_scale is None:
+            raise RuntimeError(
+                "W4A8 fused GMM/SwiGLU requires both w13_weight_scale and "
+                "w13_scale_bias tensors."
+            )
+        if scale_bias.ndim != 2 or scale_bias.shape != weight_scale.shape:
+            raise RuntimeError(
+                "W4A8 fused GMM/SwiGLU expects w13_scale_bias and "
+                f"w13_weight_scale to have the same [E, N] shape, got "
+                f"{tuple(scale_bias.shape)} and {tuple(weight_scale.shape)}."
+            )
+        weight_assist_matrix = [scale_bias]
         return torch.ops.npu.npu_grouped_matmul_swiglu_quant_v2(
             x=hidden_states,
             weight=[quant_info.w13_weight],
-            weight_scale=[quant_info.w13_weight_scale],
+            weight_scale=[weight_scale],
             x_scale=pertoken_scale,
             group_list=expert_tokens,
             weight_assist_matrix=weight_assist_matrix,

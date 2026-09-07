@@ -41,6 +41,14 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
                 f"weight_prefix must be 'w13' or 'w2', got '{weight_prefix}'"
             )
         self.quant_config = quant_config
+        quant_description = getattr(quant_config, "quant_description", quant_config)
+        self.new_quant_version = (
+            quant_description.get("version", "0") == "1.0.0"
+            if hasattr(quant_description, "get")
+            else False
+        )
+        if group_size == 0 and hasattr(quant_description, "get"):
+            group_size = int(quant_description.get("group_size", 0) or 0)
         self.weight_prefix = weight_prefix
         self.group_size = group_size
         self.tp_size = tp_size
@@ -49,6 +57,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         self.kernel = NPUW4A8Int8MoEMethod(
             is_per_channel_weight=self.is_per_channel_weight,
             activation_use_clip=self.activation_use_clip,
+            new_quant_version=self.new_quant_version,
         )
 
     def create_weights(
@@ -62,18 +71,30 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         self.num_experts = num_experts
+        self.tp_size = getattr(layer, "moe_tp_size", self.tp_size)
+        # The kernel needs to distinguish a real v1.0.0 offline scale bias
+        # from the placeholder parameter used for old ModelSlim exports.
+        layer._modelslim_w4a8_new_quant = self.new_quant_version
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
 
         # Determine dimensions based on weight group
         if self.weight_prefix == "w13":
-            out_features = intermediate_size_per_partition
+            # ModelSlim 1.0.0 stores two int4 values per int8 along the
+            # output axis; older exports store the complete output axis.
+            out_features = (
+                intermediate_size_per_partition
+                if self.new_quant_version
+                else 2 * intermediate_size_per_partition
+            )
             in_features = hidden_size
+            scale_out_features = 2 * intermediate_size_per_partition
             bias_last_dim = 1
         else:  # w2
-            out_features = hidden_size // 2
+            out_features = hidden_size // 2 if self.new_quant_version else hidden_size
             in_features = intermediate_size_per_partition
+            scale_out_features = hidden_size
             bias_last_dim = 16 // self.tp_size
 
         prefix = self.weight_prefix
@@ -89,7 +110,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         # ---- scale ----
 
         scale = torch.nn.Parameter(
-            torch.empty(num_experts, 2 * out_features, 1, dtype=torch.float32),
+            torch.empty(num_experts, scale_out_features, 1, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_scale", scale)
@@ -97,7 +118,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
 
         # ---- offset ----
         offset = torch.nn.Parameter(
-            torch.empty(num_experts, 2 * out_features, 1, dtype=torch.float32),
+            torch.empty(num_experts, scale_out_features, 1, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_offset", offset)
@@ -108,7 +129,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             scale_second = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * out_features,
+                    scale_out_features,
                     in_features // self.group_size,
                     dtype=torch.float32,
                 ),
@@ -120,7 +141,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             offset_second = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * out_features,
+                    scale_out_features,
                     in_features // self.group_size,
                     dtype=torch.float32,
                 ),
@@ -133,7 +154,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         # This parameter is always created; the kernel uses it only when activation_use_clip is True.
         scale_bias = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32
+                num_experts, scale_out_features, bias_last_dim, dtype=torch.float32
             ),
             requires_grad=False,
         )

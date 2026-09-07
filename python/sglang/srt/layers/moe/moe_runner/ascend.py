@@ -178,6 +178,7 @@ class AscendRunnerCore(MoeRunnerCore):
             use_fused_w4a8_swiglu = (
                 isinstance(w13_kernel, NPUW4A8Int8MoEMethod)
                 and w13_kernel.is_per_channel_weight
+                and not w13_kernel.activation_use_clip
                 and isinstance(self.activation, NPUSwigluDeepEPKernel)
                 and runner_input.hidden_states_scale is not None
                 and self.config.gemm1_alpha is None
