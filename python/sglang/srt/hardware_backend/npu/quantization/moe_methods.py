@@ -767,22 +767,16 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         """Restore v1.0.0 output channels for CANN's native fused op.
 
         ModelSlim 1.0.0 stores two signed int4 values in each int8 row.  The
-        native operator requires a quint4x2 tensor with the logical, unpacked
-        view shape, unlike vLLM's custom wrapper which patches that view from
-        ``weight_scale``.
+        native operator requires an ND int8 tensor with the logical, unpacked
+        ``[E, K, N]`` view shape. Do not call ``npu_quantize`` here: that would
+        compress the logical N axis back to N/2 and make CANN infer the wrong
+        output shape.
         """
-        import torch_npu
-
         packed = weight.to(torch.int16)
         low = (packed & 0x0F).to(torch.int8) - 8
         high = ((packed >> 4) & 0x0F).to(torch.int8) - 8
         unpacked = torch.cat((low, high), dim=1)
-        unpacked = unpacked.transpose(1, 2).contiguous()
-        unpacked = npu_format_cast(unpacked)
-        scale = torch.ones(1, dtype=torch.float32, device=unpacked.device)
-        return torch_npu.npu_quantize(
-            unpacked.to(torch.float32), scale, None, torch.quint4x2, -1, False
-        )
+        return unpacked.transpose(1, 2).contiguous()
 
     def apply(
         self,
