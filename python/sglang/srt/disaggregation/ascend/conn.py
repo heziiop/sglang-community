@@ -7,14 +7,22 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
+from sglang.srt.disaggregation.ascend.utils import (
+    build_dcp_replicated_kv_entry_mask,
+    build_replicated_dcp_token_indices,
+)
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    build_dcp_token_transfer_plan,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -35,6 +43,10 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def _dcp_replicated_kv_group(self) -> Optional[int]:
+        # NPU MLA registers [K, V], while NPU DSA adds index-K as group 2.
+        return 2 if getattr(self.kv_args, "kv_buf_groups", 1) == 3 else None
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)
@@ -66,6 +78,41 @@ class AscendKVManager(MooncakeKVManager):
             lens.extend(component_lens)
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        if self._dcp_replicated_kv_group() is not None and self.dcp_size != 1:
+            raise RuntimeError(
+                "Ascend DSA PD currently requires prefill dcp_size=1, got "
+                f"prefill dcp_size={self.dcp_size}"
+            )
+        return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
+
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+        # The common DCP packer is CUDA-only. Ascend submits the rank-owned
+        # MLA rows as one batched transfer request instead.
+        self._dcp_pack_buffers = []
+
+    def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
+        replicated_group = self._dcp_replicated_kv_group()
+        if replicated_group is None:
+            return super().prepare_dcp_token_item_lens(dst_page_item_lens)
+
+        page_size = self.kv_args.page_size
+        src_page_item_lens = self.kv_args.kv_item_lens
+        if src_page_item_lens and (
+            not dst_page_item_lens or dst_page_item_lens[0] != src_page_item_lens[0]
+        ):
+            raise RuntimeError(
+                "PD DCP source/destination MLA geometry differs: "
+                f"src_first={src_page_item_lens[0] if src_page_item_lens else None}, "
+                f"dst_first={dst_page_item_lens[0] if dst_page_item_lens else None}"
+            )
+        if any(item_len % page_size != 0 for item_len in src_page_item_lens):
+            raise RuntimeError(
+                "Ascend PD DCP requires page-aligned KV item lengths, got "
+                f"{src_page_item_lens} with page_size={page_size}"
+            )
+        return [item_len // page_size for item_len in src_page_item_lens]
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
@@ -272,6 +319,170 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def send_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+        pack_buffer=None,
+    ) -> int:
+        replicated_group = self._dcp_replicated_kv_group()
+        if replicated_group is None:
+            return super().send_kvcache_dcp(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                dcp_token_item_lens=dcp_token_item_lens,
+                dst_dcp_size=dst_dcp_size,
+                dst_dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+                executor=executor,
+                dst_layer_ids=dst_layer_ids,
+                pack_buffer=None,
+            )
+
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
+        if not self.kv_args.kv_data_ptrs:
+            return 0
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=self.kv_args.page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        full_src_token_indices, full_dst_token_indices = (
+            build_replicated_dcp_token_indices(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=self.kv_args.page_size,
+                dcp_size=dst_dcp_size,
+                src_page_offset=src_page_offset,
+                num_kv_tokens=num_kv_tokens,
+            )
+        )
+        if plan.src_token_indices.size == 0 and full_src_token_indices.size == 0:
+            return 0
+
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            src_kv_ptrs = self.kv_args.kv_data_ptrs
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+        else:
+            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs,
+                dst_kv_ptrs,
+            )
+
+        group_count = getattr(self.kv_args, "kv_buf_groups", 1)
+        if replicated_group != 2 or group_count != 3:
+            raise RuntimeError(
+                "Ascend DSA PD DCP requires [MLA-K, MLA-V, index-K] buffer "
+                "groups, got "
+                f"group={replicated_group}, group_count={group_count}"
+            )
+        if len(src_kv_ptrs) != len(dst_kv_ptrs) or len(src_kv_ptrs) % group_count:
+            raise RuntimeError(
+                "Ascend PD DCP grouped KV layout is inconsistent: "
+                f"src={len(src_kv_ptrs)}, dst={len(dst_kv_ptrs)}, "
+                f"groups={group_count}"
+            )
+        if len(dcp_token_item_lens) < len(src_kv_ptrs):
+            raise RuntimeError(
+                "Ascend PD DCP item-length list is shorter than the KV layout: "
+                f"items={len(dcp_token_item_lens)}, kv={len(src_kv_ptrs)}"
+            )
+
+        try:
+            replicated_entries = build_dcp_replicated_kv_entry_mask(
+                len(src_kv_ptrs),
+                replicated_group=replicated_group,
+                group_count=group_count,
+                num_draft_layers=getattr(self.kv_args, "draft_kv_layers", 0),
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if not replicated_entries:
+            raise RuntimeError(
+                "Ascend PD DCP has no KV layers after PP/layer-id filtering"
+            )
+        mla_src_groups, mla_dst_groups = group_concurrent_contiguous(
+            plan.src_token_indices,
+            plan.dst_token_indices,
+        )
+        full_src_groups, full_dst_groups = group_concurrent_contiguous(
+            full_src_token_indices,
+            full_dst_token_indices,
+        )
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, token_item_len: int, replicated: bool
+        ) -> List[Tuple[int, int, int]]:
+            if replicated:
+                src_groups, dst_groups = full_src_groups, full_dst_groups
+            else:
+                src_groups, dst_groups = mla_src_groups, mla_dst_groups
+            return [
+                (
+                    src_ptr + int(src_group[0]) * token_item_len,
+                    dst_ptr + int(dst_group[0]) * token_item_len,
+                    len(src_group) * token_item_len,
+                )
+                for src_group, dst_group in zip(src_groups, dst_groups)
+            ]
+
+        layers_params = [
+            (
+                src_ptr,
+                dst_ptr,
+                dcp_token_item_lens[layer_id],
+                replicated_entries[layer_id],
+            )
+            for layer_id, (src_ptr, dst_ptr) in enumerate(zip(src_kv_ptrs, dst_kv_ptrs))
+        ]
+
+        def process_layer(
+            src_ptr: int, dst_ptr: int, token_item_len: int, replicated: bool
+        ) -> int:
+            return self._transfer_data(
+                mooncake_session_id,
+                set_transfer_blocks(src_ptr, dst_ptr, token_item_len, replicated),
+            )
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(process_layer, *params) for params in layers_params
+            ]
+            return self._await_transfer_futures(futures)
+
+        transfer_blocks = []
+        for params in layers_params:
+            transfer_blocks.extend(set_transfer_blocks(*params))
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.
