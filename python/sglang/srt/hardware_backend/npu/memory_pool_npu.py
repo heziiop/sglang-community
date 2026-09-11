@@ -535,8 +535,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         device: str,
         enable_memory_saver: bool,
         index_head_dim: Optional[int] = None,
+        index_size: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_page_size: Optional[int] = None,
+        kv_page_padding: int = 1,
+        index_page_padding: int = 1,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -557,6 +561,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
+        self.index_page_size = page_size if index_page_size is None else index_page_size
+        self.index_size = size if index_size is None else index_size
+        if kv_page_padding < 1 or index_page_padding < 1:
+            raise ValueError("NPU MLA page padding must be positive")
+        self.kv_page_padding = kv_page_padding
+        self.index_page_padding = index_page_padding
 
         self.custom_mem_pool = None
 
@@ -569,7 +579,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.k_buffer = torch.zeros(
                     (
                         layer_num,
-                        self.size // self.page_size + 1,
+                        self.size // self.page_size + self.kv_page_padding,
                         self.page_size,
                         1,
                         self.kv_lora_rank,
@@ -580,7 +590,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.v_buffer = torch.zeros(
                     (
                         layer_num,
-                        self.size // self.page_size + 1,
+                        self.size // self.page_size + self.kv_page_padding,
                         self.page_size,
                         1,
                         self.qk_rope_head_dim,
@@ -593,8 +603,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.index_k_buffer = torch.zeros(
                     (
                         layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
+                        self.index_size // self.index_page_size
+                        + self.index_page_padding,
+                        self.index_page_size,
                         1,
                         self.index_head_dim,
                     ),
