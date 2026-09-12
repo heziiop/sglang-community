@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -539,8 +540,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_page_size: Optional[int] = None,
-        kv_page_padding: int = 1,
-        index_page_padding: int = 1,
+        is_draft_worker: bool = False,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -563,10 +563,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         self.index_page_size = page_size if index_page_size is None else index_page_size
         self.index_size = size if index_size is None else index_size
+        self.dcp_size = get_parallel().attn_dcp_size
+        global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
+        kv_page_padding = global_page_padding if is_draft_worker else 1
+        index_page_padding = global_page_padding if index_head_dim is not None else 1
         if kv_page_padding < 1 or index_page_padding < 1:
             raise ValueError("NPU MLA page padding must be positive")
         self.kv_page_padding = kv_page_padding
         self.index_page_padding = index_page_padding
+        self.is_draft_worker = is_draft_worker
 
         self.custom_mem_pool = None
 
@@ -685,30 +690,67 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.index_k_buffer[layer_id - self.start_layer]
 
+    def _get_disagg_buffer_view(
+        self,
+        buffer: torch.Tensor,
+        *,
+        page_size: int,
+        uses_global_slots: bool,
+    ) -> torch.Tensor:
+        """Expose the byte stride used by PD without changing kernel views."""
+        if buffer.shape[1] != page_size:
+            raise RuntimeError(
+                "NPU MLA disaggregation buffer page shape is inconsistent: "
+                f"shape={tuple(buffer.shape)}, page_size={page_size}"
+            )
+        transfer_page_size = (
+            page_size * self.dcp_size
+            if uses_global_slots and self.dcp_size > 1
+            else page_size
+        )
+        num_slots = buffer.shape[0] * page_size
+        if num_slots % transfer_page_size:
+            raise RuntimeError(
+                "NPU MLA disaggregation buffer cannot be viewed as integral "
+                f"transfer pages: slots={num_slots}, "
+                f"transfer_page_size={transfer_page_size}"
+            )
+        return buffer.view(
+            num_slots // transfer_page_size,
+            transfer_page_size,
+            *buffer.shape[2:],
+        )
+
     # for disagg
     def get_contiguous_buf_infos(self):
         self._raise_if_native_kv_cache_disabled()
-        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
-            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        # DCP target attention K/V is rank-local. The target indexer and every
+        # draft buffer retain allocator-global slots, so their PD page stride
+        # spans dcp_size adjacent physical pages. A transfer-only view exposes
+        # that stride without changing the tensor shape seen by NPU kernels.
+        buffers = list(self.k_buffer) + list(self.v_buffer)
+        page_sizes = [self.page_size] * len(buffers)
+        uses_global_slots = [self.is_draft_worker] * len(buffers)
         if self.index_head_dim is not None:
-            kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
-            ]
-            kv_data_lens += [
-                self.index_k_buffer[i].nbytes for i in range(self.layer_num)
-            ]
-            kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
-            ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
+            buffers += list(self.index_k_buffer)
+            page_sizes += [self.index_page_size] * self.layer_num
+            uses_global_slots += [True] * self.layer_num
+
+        transfer_views = [
+            self._get_disagg_buffer_view(
+                buffer,
+                page_size=page_size,
+                uses_global_slots=global_slots,
+            )
+            for buffer, page_size, global_slots in zip(
+                buffers, page_sizes, uses_global_slots
+            )
+        ]
+        return (
+            [buffer.data_ptr() for buffer in transfer_views],
+            [buffer.nbytes for buffer in transfer_views],
+            [buffer[0].nbytes for buffer in transfer_views],
+        )
 
     def set_kv_buffer(
         self,
