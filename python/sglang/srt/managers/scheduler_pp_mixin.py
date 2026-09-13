@@ -803,14 +803,28 @@ class SchedulerPPMixin:
         if msg_type == "default":
             logger.warning_once(
                 "PP send: using default untyped message. "
-                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts"
             )
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
+
+        # The send-allgather optimization (send 1/N, all-gather on receiver)
+        # assumes the tensor is REPLICATED across TP ranks. When the last
+        # layer's output is SCATTERED (moe_dense_tp_size=1 or deepep A2A),
+        # each TP rank holds a different token subset, so we must send the
+        # full local tensor instead of a slice.
+        from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        use_all_gather = not (
+            enable_moe_dense_fully_dp()
+            or not get_moe_a2a_backend().is_none()
+        )
+        all_gather_group = self.attn_tp_group if use_all_gather else None
+
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=(self.attn_tp_group),
+                all_gather_group=all_gather_group,
                 async_send=async_send,
             )
         )
@@ -852,10 +866,18 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+            use_all_gather = not (
+                enable_moe_dense_fully_dp()
+                or not get_moe_a2a_backend().is_none()
+            )
+            all_gather_group = self.attn_tp_group if use_all_gather else None
+
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=all_gather_group,
                 )
             )
         return pp_proxy_tensors
@@ -863,9 +885,16 @@ class SchedulerPPMixin:
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
+        from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        use_all_gather = not (
+            enable_moe_dense_fully_dp()
+            or not get_moe_a2a_backend().is_none()
+        )
+        all_gather_group = self.attn_tp_group if use_all_gather else None
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=all_gather_group,
         )
 
     def _pp_make_skip_output_result(
