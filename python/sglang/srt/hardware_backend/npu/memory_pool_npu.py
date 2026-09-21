@@ -814,13 +814,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             *buffer.shape[2:],
         )
 
-    # for disagg
-    def get_contiguous_buf_infos(self):
+    def _get_disagg_buffer_views(self):
+        """Single source of truth for the PD entry order of this pool.
+
+        DCP target attention K/V is rank-local. The target indexer and every
+        draft buffer retain allocator-global slots, so their PD page stride
+        spans dcp_size adjacent physical pages. A transfer-only view exposes
+        that stride without changing the tensor shape seen by NPU kernels.
+
+        Every method below derives from this one so the published pointers,
+        item lengths, and local tensor references cannot drift in entry order.
+        """
         self._raise_if_native_kv_cache_disabled()
-        # DCP target attention K/V is rank-local. The target indexer and every
-        # draft buffer retain allocator-global slots, so their PD page stride
-        # spans dcp_size adjacent physical pages. A transfer-only view exposes
-        # that stride without changing the tensor shape seen by NPU kernels.
         buffers = list(self.k_buffer)
         page_sizes = [self.page_size] * len(buffers)
         uses_global_slots = [self.is_draft_worker] * len(buffers)
@@ -847,11 +852,46 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 buffers, page_sizes, uses_global_slots
             )
         ]
+        return transfer_views
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        transfer_views = self._get_disagg_buffer_views()
         return (
             [buffer.data_ptr() for buffer in transfer_views],
             [buffer.nbytes for buffer in transfer_views],
             [buffer[0].nbytes for buffer in transfer_views],
         )
+
+    def get_contiguous_buf_tensors(self):
+        return self._get_disagg_buffer_views()
+
+    def get_dcp_remote_decode_layout(self) -> list[bool]:
+        """Return whether each PD entry uses decode-global DCP slots.
+
+        The order is identical to ``get_contiguous_buf_tensors()`` and
+        ``get_contiguous_buf_infos()``.  Attention K/V belongs to the decode
+        rank, while the DSA index buffers and draft-cache entries retain the
+        allocator-global slot numbering.  Keeping this beside the pool
+        geometry avoids reproducing the FP8/non-FP8 and index-buffer ordering
+        in the transport layer.
+        """
+        target_global = self.is_draft_worker
+        layout = [target_global] * self.layer_num
+        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+            layout.extend([target_global] * self.layer_num)
+        if self.index_head_dim is not None:
+            layout.extend([True] * self.num_indexer_layers)
+            if self.index_k_scale_buffer is not None:
+                layout.extend([True] * self.num_indexer_layers)
+
+        expected = len(self.get_contiguous_buf_tensors())
+        if len(layout) != expected:
+            raise RuntimeError(
+                "NPU MLA DCP layout is inconsistent with transfer buffers: "
+                f"layout={len(layout)}, buffers={expected}"
+            )
+        return layout
 
     def get_kv_layer_ids(self):
         return (

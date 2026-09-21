@@ -1,20 +1,29 @@
 import concurrent.futures
 import enum
 import logging
+import threading
 from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.disaggregation.ascend.dcp_pack import (
+    AscendDCPPackBuffer,
+    init_ascend_dcp_pack_buffers,
+)
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    build_dcp_token_transfer_plan,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -35,6 +44,30 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def __init__(
+        self,
+        args,
+        disaggregation_mode,
+        server_args,
+        is_mla_backend: Optional[bool] = False,
+        dcp_source_tensors=None,
+        dcp_remote_decode_layout=None,
+    ):
+        # Local NPU tensor refs used by the DCP 1 -> N gather path. Keep them
+        # out of the shared KVArgs container: they are neither wire metadata nor
+        # meaningful to decode/other transfer backends. Store them before the
+        # parent starts the bootstrap thread.
+        self._dcp_source_tensors = list(dcp_source_tensors or [])
+        self._dcp_remote_decode_layout = (
+            None if dcp_remote_decode_layout is None else list(dcp_remote_decode_layout)
+        )
+        self._dcp_pack_spec = None
+        # Guards the one-shot pack buffer allocation against a repeated peer
+        # registration racing the bootstrap thread. This must also exist before
+        # the parent starts that thread.
+        self._dcp_pack_buffers_lock = threading.Lock()
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+
     def _is_npu_dsa_layout(self) -> bool:
         return getattr(self.kv_args, "kv_buf_groups", 1) == 3
 
@@ -72,15 +105,115 @@ class AscendKVManager(MooncakeKVManager):
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
+            # A prefill rank with DCP=1 holds every logical token, so it can
+            # relayout onto any decode DCP width. The reverse (N -> M, or N -> 1)
+            # would have to merge rank-local KV back together first.
+            if self.dcp_size == 1 and dst_dcp_size > 1:
+                return True
             raise RuntimeError(
-                "NPU DSA PD requires matching prefill/decode DCP sizes, got "
+                "NPU DSA PD supports prefill DCP 1 -> decode DCP N only, got "
                 f"prefill={self.dcp_size}, decode={dst_dcp_size}"
             )
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
 
+    def prepare_dcp_token_item_lens(
+        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+    ) -> List[int]:
+        if not self._is_npu_dsa_layout():
+            return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
+
+        src_ptrs = self.kv_args.kv_data_ptrs
+        src_item_lens = self.kv_args.kv_item_lens
+        if len(dst_page_item_lens) != len(src_item_lens):
+            raise RuntimeError(
+                "Ascend PD DCP entry count differs: "
+                f"src={len(src_item_lens)}, dst={len(dst_page_item_lens)}"
+            )
+        if len(src_ptrs) != len(src_item_lens):
+            raise RuntimeError(
+                "Ascend PD DCP source KV metadata is inconsistent: "
+                f"item_lens={len(src_item_lens)}, ptrs={len(src_ptrs)}"
+            )
+        self._get_dcp_remote_decode_layout()
+
+        token_item_lens = []
+        for entry, item_len in enumerate(src_item_lens):
+            if item_len % self.kv_args.page_size:
+                raise RuntimeError(f"Ascend PD DCP entry {entry} is not page aligned")
+            token_item_lens.append(item_len // self.kv_args.page_size)
+        return token_item_lens
+
+    def _get_dcp_remote_decode_layout(self) -> List[bool]:
+        """Get source-entry DCP address spaces from the owning NPU pools."""
+        layout = self._dcp_remote_decode_layout
+        if layout is None:
+            raise RuntimeError(
+                "Ascend PD DCP relayout requires the NPU pool remote decode layout"
+            )
+        if len(layout) != len(self.kv_args.kv_data_ptrs):
+            raise RuntimeError(
+                "Ascend PD DCP layout does not match KV entries: "
+                f"layout={len(layout)}, ptrs={len(self.kv_args.kv_data_ptrs)}"
+            )
+        return layout
+
     def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
-        # The common DCP packer is CUDA-only. npu uses the unpacked path.
-        self._dcp_pack_buffers = []
+        # The common CUDA packer cannot be used on NPU. Non-DSA Ascend peers
+        # retain the existing direct-transfer path.
+        if not self._is_npu_dsa_layout():
+            self._dcp_pack_buffers = []
+            return
+
+        layout = self._get_dcp_remote_decode_layout()
+        local_entries = [i for i, is_global in enumerate(layout) if not is_global]
+        token_item_lens = [
+            item_len // self.kv_args.page_size for item_len in self.kv_args.kv_item_lens
+        ]
+        self._init_ascend_dcp_pack_buffers_once(local_entries, token_item_lens)
+
+    def _init_ascend_dcp_pack_buffers_once(
+        self, local_entries: List[int], token_item_lens: List[int]
+    ) -> None:
+        spec = (tuple(local_entries), tuple(token_item_lens[i] for i in local_entries))
+        with self._dcp_pack_buffers_lock:
+            if self._dcp_pack_buffers is not None:
+                if spec != self._dcp_pack_spec:
+                    raise RuntimeError(
+                        "Ascend PD DCP peers have incompatible rank-local KV layouts"
+                    )
+                return
+            num_entries = len(self.kv_args.kv_data_ptrs)
+            if not (
+                len(self.kv_args.kv_item_lens)
+                == len(self._dcp_source_tensors)
+                == num_entries
+            ):
+                raise RuntimeError(
+                    "Ascend PD DCP relayout requires parallel KV entry metadata: "
+                    f"ptrs={num_entries}, item_lens={len(self.kv_args.kv_item_lens)}, "
+                    f"tensors={len(self._dcp_source_tensors)}"
+                )
+            buffers = init_ascend_dcp_pack_buffers(
+                self.engine.batch_register,
+                batch_indices=self.max_transfer_batch_indices,
+                page_size=self.kv_args.page_size,
+                kv_item_lens=self.kv_args.kv_item_lens,
+                local_entry_indices=local_entries,
+                count=len(self.transfer_queues),
+                device=f"npu:{self.kv_args.gpu_id}",
+            )
+            # Published only once every buffer is registered: a half-registered
+            # set must never be visible to the transfer workers.
+            self._dcp_pack_buffers = buffers
+            self._dcp_pack_spec = spec
+
+    def deregister_buffer_to_engine(self):
+        super().deregister_buffer_to_engine()
+        buffers = self._dcp_pack_buffers or []
+        if buffers:
+            self.engine.batch_deregister([buffer.get_ptr() for buffer in buffers])
+            self._dcp_pack_buffers = None
+            self._dcp_pack_spec = None
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
@@ -302,6 +435,166 @@ class AscendKVManager(MooncakeKVManager):
             # compared to using multiple threads
             return process_layers(layers_params)
 
+        return 0
+
+    def send_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+        pack_buffer: Optional[AscendDCPPackBuffer] = None,
+    ) -> int:
+        """Send one chunk of a prefill DCP=1 -> decode DCP=N relayout.
+
+        Two phases. The allocator-global entries (target indexer, index scale,
+        draft) already hold the whole logical token order, so all of them go out
+        in a single direct RDMA per destination session. The rank-local
+        attention KV has to be gathered per destination DCP rank instead, in
+        batches capped at `max_transfer_batch_indices` rows, which is what keeps
+        the pack buffer bounded rather than the request length.
+
+        Global first: a failure there costs no gather, and the decode only
+        learns of success once every KV, state and aux byte has landed, so the
+        order is invisible to it.
+        """
+        if not self._is_npu_dsa_layout():
+            return super().send_kvcache_dcp(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                dcp_token_item_lens=dcp_token_item_lens,
+                dst_dcp_size=dst_dcp_size,
+                dst_dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+                executor=executor,
+                dst_layer_ids=dst_layer_ids,
+                pack_buffer=pack_buffer,
+            )
+        if pack_buffer is None:
+            raise RuntimeError(
+                "Ascend PD DCP relayout requires "
+                "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES > 0 on the prefill "
+                "server, which is what sizes the pack buffer"
+            )
+        src_kv_ptrs = self.kv_args.kv_data_ptrs
+        if self.kv_args.kv_layer_ids or dst_layer_ids:
+            dst_entries = resolve_dcp_dst_entry_indices(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
+            )
+        else:
+            _, aligned_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+            ptr_to_entry = {ptr: i for i, ptr in enumerate(dst_kv_ptrs)}
+            if len(ptr_to_entry) != len(dst_kv_ptrs):
+                raise RuntimeError("Ascend PD DCP requires distinct decode KV pointers")
+            dst_entries = [ptr_to_entry[ptr] for ptr in aligned_ptrs]
+        dst_kv_ptrs = [dst_kv_ptrs[entry] for entry in dst_entries]
+
+        remote_layout = self._get_dcp_remote_decode_layout()
+        local_entries = [
+            i for i, is_global in enumerate(remote_layout) if not is_global
+        ]
+        local_entry_set = set(local_entries)
+        global_entries = [
+            entry for entry in range(len(src_kv_ptrs)) if entry not in local_entry_set
+        ]
+
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=self.kv_args.page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.empty():
+            return 0
+
+        def set_transfer_blocks(src_ptr, dst_ptr, item_len, groups):
+            src_groups, dst_groups = groups
+            return [
+                (
+                    src_ptr + int(src[0]) * item_len,
+                    dst_ptr + int(dst[0]) * item_len,
+                    len(src) * item_len,
+                )
+                for src, dst in zip(src_groups, dst_groups)
+            ]
+
+        # The shared plan calls these draft/target: here allocator-global
+        # indexer (and draft) use draft rows; rank-local attention uses target.
+        if global_entries and plan.draft_src_token_indices.size:
+            global_groups = group_concurrent_contiguous(
+                plan.draft_src_token_indices, plan.draft_dst_token_indices
+            )
+            global_blocks: List[Tuple[int, int, int]] = []
+            for entry in global_entries:
+                global_blocks.extend(
+                    set_transfer_blocks(
+                        src_kv_ptrs[entry],
+                        dst_kv_ptrs[entry],
+                        dcp_token_item_lens[entry],
+                        global_groups,
+                    )
+                )
+            ret = self._transfer_data(mooncake_session_id, global_blocks)
+            if ret != 0:
+                return ret
+
+        if local_entries and len(self._dcp_source_tensors) != len(src_kv_ptrs):
+            raise RuntimeError(
+                "Ascend PD DCP relayout needs the source KV tensors to gather "
+                f"the rank-local entries: tensors="
+                f"{len(self._dcp_source_tensors)}, entries={len(src_kv_ptrs)}"
+            )
+
+        local_src = plan.target_src_token_indices
+        local_dst = plan.target_dst_token_indices
+        batch_cap = self.max_transfer_batch_indices
+        # Ownership is decided over the whole chunk before it is split, so a
+        # batch never re-derives residues from a partial page.
+        for batch_start in range(0, local_src.size, batch_cap):
+            batch_end = min(batch_start + batch_cap, local_src.size)
+            local_groups = group_concurrent_contiguous(
+                np.arange(batch_end - batch_start, dtype=np.int64),
+                local_dst[batch_start:batch_end],
+            )
+            packed_ptrs = pack_buffer.pack(
+                entries=local_entries,
+                src_tensors=self._dcp_source_tensors,
+                token_item_lens=dcp_token_item_lens,
+                src_token_indices=local_src[batch_start:batch_end],
+            )
+            local_blocks: List[Tuple[int, int, int]] = []
+            for slot, entry in enumerate(local_entries):
+                local_blocks.extend(
+                    set_transfer_blocks(
+                        packed_ptrs[slot],
+                        dst_kv_ptrs[entry],
+                        dcp_token_item_lens[entry],
+                        local_groups,
+                    )
+                )
+            ret = self._transfer_data(mooncake_session_id, local_blocks)
+            if ret != 0:
+                return ret
         return 0
 
     def _is_generic_kvcache_state_type(self, st) -> bool:

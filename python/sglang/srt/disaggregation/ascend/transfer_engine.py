@@ -83,14 +83,32 @@ class AscendTransferEngine(MooncakeTransferEngine):
             logger.error("Ascend Transfer Engine initialization failed.")
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]):
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
+        """Register every region, or raise. Callers publish nothing on failure.
+
+        A region that is not registered cannot be the source or target of any
+        transfer, so failing here beats a silent debug log that only surfaces
+        as a failed request transfer later.
+        """
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark register as failed
-            ret_value = -1
+        except Exception as e:
+            raise RuntimeError(
+                f"Ascend memory registration raised for {len(ptrs)} region(s)"
+            ) from e
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            raise RuntimeError(
+                "Ascend memory registration failed with status "
+                f"{ret_value} for {len(ptrs)} region(s)"
+            )
+
+    def batch_deregister(self, ptrs: List[int]) -> None:
+        # memfabric registers in batch but only unregisters one region at a
+        # time, and the base class' batch_unregister_memory does not exist here.
+        for ptr in ptrs:
+            ret_value = self.engine.unregister_memory(ptr)
+            if ret_value != 0:
+                logger.warning("Ascend memory deregistration failed for %s.", ptr)
 
     @staticmethod
     def _get_transfer_protocol() -> str:
