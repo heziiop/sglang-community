@@ -64,9 +64,10 @@ class AscendDCPPackBuffer:
         """Gather one local batch; return the packed source pointer per entry.
 
         `entries` are local KV entry indices, in the same order as the entry
-        token sizes this buffer was built with. The gather reads source rows the
-        forward wrote, so it is queued behind the default stream and the caller
-        only resumes once it has landed.
+        token sizes this buffer was built with. The regular transfer path has
+        already established source-KV readiness before enqueueing the work. Keep
+        the index upload and gather together on this buffer's private stream,
+        and only return once the packed rows have landed.
         """
         count = int(src_token_indices.size)
         if count == 0:
@@ -77,14 +78,12 @@ class AscendDCPPackBuffer:
                 f"tokens={count}, batch_indices={self._batch_indices}"
             )
         row_indices = self._row_indices[:count]
-        row_indices.copy_(
-            torch.from_numpy(
-                np.ascontiguousarray(src_token_indices, dtype=np.int64)
-            ).to(self._buffer.device)
+        host_row_indices = torch.from_numpy(
+            np.ascontiguousarray(src_token_indices, dtype=np.int64)
         )
-        self._gather_stream.wait_stream(torch.npu.current_stream())
         packed_ptrs: List[int] = []
         with torch.npu.stream(self._gather_stream):
+            row_indices.copy_(host_row_indices)
             for slot, entry in enumerate(entries):
                 token_bytes = int(token_item_lens[entry])
                 region = self._region(slot, count, token_bytes)
