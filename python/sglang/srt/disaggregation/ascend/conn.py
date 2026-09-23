@@ -23,7 +23,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -490,28 +489,14 @@ class AscendKVManager(MooncakeKVManager):
                 "server, which is what sizes the pack buffer"
             )
         src_kv_ptrs = self.kv_args.kv_data_ptrs
-        if self.kv_args.kv_layer_ids or dst_layer_ids:
-            dst_entries = resolve_dcp_dst_entry_indices(
-                self.kv_args.kv_layer_ids,
-                dst_layer_ids,
-                len(src_kv_ptrs),
-                len(dst_kv_ptrs),
-            )
-        else:
-            _, aligned_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
-            ptr_to_entry = {ptr: i for i, ptr in enumerate(dst_kv_ptrs)}
-            if len(ptr_to_entry) != len(dst_kv_ptrs):
-                raise RuntimeError("Ascend PD DCP requires distinct decode KV pointers")
-            dst_entries = [ptr_to_entry[ptr] for ptr in aligned_ptrs]
-        dst_kv_ptrs = [dst_kv_ptrs[entry] for entry in dst_entries]
+        _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
 
         remote_layout = self._get_dcp_remote_decode_layout()
         local_entries = [
             i for i, is_global in enumerate(remote_layout) if not is_global
         ]
-        local_entry_set = set(local_entries)
         global_entries = [
-            entry for entry in range(len(src_kv_ptrs)) if entry not in local_entry_set
+            entry for entry in range(len(src_kv_ptrs)) if entry not in local_entries
         ]
 
         plan = build_dcp_token_transfer_plan(
