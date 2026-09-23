@@ -46,6 +46,7 @@ class AscendDCPPackBuffer:
         self._buffer = torch.zeros(size_bytes, dtype=torch.uint8, device=device)
         self._row_indices = torch.empty(batch_indices, dtype=torch.int64, device=device)
         self._gather_stream = torch.npu.Stream()
+        self._gather_done = torch.npu.Event()
 
     def get_ptr(self) -> int:
         return self._buffer.data_ptr()
@@ -92,7 +93,10 @@ class AscendDCPPackBuffer:
                 src_rows = src_tensors[entry].view(torch.uint8).reshape(-1, token_bytes)
                 torch.index_select(src_rows, 0, row_indices, out=region)
                 packed_ptrs.append(self._buffer.data_ptr() + self._entry_offsets[slot])
-        self._gather_stream.synchronize()
+            # Event synchronization waits until the record task has passed
+            # through torch_npu's task queue before waiting for NPU completion.
+            self._gather_done.record(self._gather_stream)
+        self._gather_done.synchronize()
         return packed_ptrs
 
     def _region(self, slot: int, count: int, token_bytes: int) -> torch.Tensor:
