@@ -699,7 +699,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if _is_npu:
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
-            if dtype != torch.float8_e4m3fn:
+            if dtype == torch.int8:
+                # A3 LI C8 stores one FP16 scale per 128-dimensional key.
+                indexer_size_per_token = index_head_dim + torch._utils._element_size(
+                    torch.float16
+                )
+                element_size = 1
+            elif dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()

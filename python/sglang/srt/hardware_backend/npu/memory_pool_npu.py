@@ -761,12 +761,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for i in self.indexer_layer_ids
         )
         requested_kv_cache_dim = kv_cache_dim
-        self.dsa_kv_cache_store_fp8 = (
+        self.dsa_kv_cache_store_c8 = (
             index_head_dim is not None
-            and dtype == torch.float8_e4m3fn
+            and dtype in (torch.float8_e4m3fn, torch.int8)
             and requested_kv_cache_dim is not None
         )
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
             assert requested_kv_cache_dim == (
                 kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
@@ -778,9 +778,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         else:
             self.rope_dtype = self.store_dtype
         self.kv_cache_dim = (
-            requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+            requested_kv_cache_dim if self.dsa_kv_cache_store_c8 else kv_lora_rank
         )
-        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_c8 else qk_rope_head_dim
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -842,7 +842,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     dtype=(
                         torch.bfloat16
-                        if self.dsa_kv_cache_store_fp8
+                        if self.dsa_kv_cache_store_c8
                         else self.rope_dtype
                     ),
                     device=self.device,
@@ -862,14 +862,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.dsa_kv_cache_store_c8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
 
                     self.index_k_scale_buffer = torch.zeros(
                         (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
+                        dtype=torch.float16 if dtype == torch.int8 else torch.float32,
                         device=self.device,
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
@@ -877,6 +877,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
 
         self._finalize_allocation_log(size)
+
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        # Shared pool adapters use this legacy name for the packed C8 layout.
+        return self.dsa_kv_cache_store_c8
 
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
@@ -907,7 +912,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 for buffer in (self.k_buffer, self.index_k_buffer)
                 if buffer is not None
             ),
-            packed_fp8=self.dsa_kv_cache_store_fp8,
+            packed_fp8=self.dsa_kv_cache_store_c8,
         )
 
     def _mla_native_buffers(self):
@@ -1047,7 +1052,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.use_combined_kv_buffer:
             return [(buffer, global_kv) for buffer in self.kv_buffer]
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+        if not getattr(self, "dsa_kv_cache_store_c8", False):
             entries += [(buffer, global_kv) for buffer in self.v_buffer]
         if self.index_head_dim is not None:
             entries += [(buffer, True) for buffer in self.index_k_buffer]
@@ -1086,13 +1091,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             2 if self.index_k_scale_buffer is not None else 1
         )
 
-    def _pack_dsa_fp8_kv_cache(self, cache_k, cache_v):
+    def _pack_dsa_c8_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)
-        quantized, scale = torch_npu.npu_dynamic_quant(
-            latent.reshape(-1, 128), dst_type=self.dtype
-        )
+        if self.dtype == torch.int8:
+            quantized, scale = torch_npu.npu_dynamic_block_quant(
+                latent.reshape(-1, 1, self.kv_lora_rank),
+                dst_type=self.dtype,
+                row_block_size=1,
+                col_block_size=128,
+            )
+        else:
+            quantized, scale = torch_npu.npu_dynamic_quant(
+                latent.reshape(-1, 128), dst_type=self.dtype
+            )
         rows = latent.shape[0]
-        # Opaque record: latent FP8 | rope BF16 bytes | per-tile FP32 scales.
+        # Opaque C8 record: latent INT8/FP8 | rope BF16 bytes | per-tile FP32 scales.
         packed = torch.cat(
             (
                 quantized.reshape(rows, self.kv_lora_rank).view(torch.uint8),
@@ -1119,12 +1132,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
+            packed = self._pack_dsa_c8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[layer_id - self.start_layer].view(
                     -1, 1, self.kv_cache_dim
@@ -1272,7 +1285,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
             if self.index_k_scale_buffer is not None:
                 buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             # Retraction copies opaque records; byte views also avoid FP8
             # advanced-indexing restrictions, without decoding/requantizing.
             buffers = [

@@ -50,16 +50,17 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
 
 def _quantize_npu_indexer_activation(x, hadamard, dst_type):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    scale_dtype = torch.float16 if dst_type == torch.int8 else torch.float32
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.empty(x.shape[:-1], dtype=scale_dtype, device=x.device),
         )
     rotated = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
         rotated.reshape(-1, 128), dst_type=dst_type
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    return quantized.reshape(x.shape), scale.to(scale_dtype).reshape(x.shape[:-1])
 
 
 def plan_indexer_query_shard(
@@ -577,6 +578,8 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
+                if pool.dtype == torch.int8:
+                    weights = weights.to(torch.float16)
                 # custom_ops can replace the torch_npu alias with a different schema.
                 topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
                     query=query,
