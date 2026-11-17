@@ -13,7 +13,7 @@ attn_tp_size, so the gate admits any width in ``[total, rows * tp_size]``.
 
 When the DSA token shard runs, ``_IndexerQueryShard.resolve`` skips the top-k
 all-gather and keeps this rank's rows, but only if the token shard planned the
-same rows.
+same rows and no MTP seed export needs batch-global row indices.
 
 Usage:
     python -m pytest test_dsa_npu_indexer_query_shard.py -v
@@ -181,6 +181,57 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
         _, _, local, gathered = self._resolve([0], [16384], 16, 3, plan_rank=5)
         self.assertFalse(local)
         self.assertTrue(gathered)
+
+    def test_mtp_seed_can_select_global_prefill_rows(self):
+        """MTP selects each request's last prefill row using batch-global offsets.
+
+        Six tokens on attention TP4 leave two top-k rows per rank. Returning
+        those local rows makes the seed's last-token index 5 out of bounds;
+        in a longer local slice it can silently select another token's row.
+        """
+        for extend_lens, select_last in (([6], True), ([2, 4], True), ([9], False)):
+            total = sum(extend_lens)
+            full_topk = torch.arange(total * 4, dtype=torch.int32).reshape(total, 4)
+            select = torch.tensor(extend_lens).cumsum(0) - 1 if select_last else None
+            expected_seed = full_topk if select is None else full_topk[select]
+            for tp_rank in range(4):
+                with self.subTest(extend=extend_lens, rank=tp_rank, select=select_last):
+                    shard = _shard_for(
+                        [0] * len(extend_lens), extend_lens, 4, tp_rank, total
+                    )
+                    plan = plan_dsa_token_shard(extend_lens, extend_lens, 4, tp_rank)
+                    seed = torch.empty_like(expected_seed)
+                    batch = types.SimpleNamespace(
+                        npu_dsa_token_shard_plan=plan,
+                        spec_info=types.SimpleNamespace(
+                            dsa_seed_topk_capture=seed,
+                            dsa_seed_topk_select=select,
+                        ),
+                    )
+                    local_topk = shard.take(full_topk)
+
+                    def gather(out, local, expected=local_topk, full=full_topk):
+                        torch.testing.assert_close(local, expected)
+                        out.zero_()
+                        out[: full.shape[0]].copy_(full)
+
+                    with mock.patch(
+                        "sglang.srt.layers.attention.dsa.dsa_npu_indexer."
+                        "attn_tp_all_gather_into_tensor",
+                        side_effect=gather,
+                    ):
+                        resolved = shard.resolve(
+                            local_topk, _ceil_align(total, 4), batch
+                        )
+                    # The same row selection performed by write_mtp_seed.
+                    src = (
+                        resolved[: seed.shape[0]]
+                        if select is None
+                        else resolved[select]
+                    )
+                    seed.copy_(src)
+                    torch.testing.assert_close(seed, expected_seed)
+                    self.assertFalse(batch.npu_indexer_topk_is_local)
 
 
 if __name__ == "__main__":
