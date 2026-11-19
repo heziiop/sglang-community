@@ -1,14 +1,19 @@
 """CPU checks for the shared NPU C8 cache layout and INT8 scale contracts."""
 
+import importlib
 import unittest
-from types import SimpleNamespace
+from contextlib import ExitStack, contextmanager, nullcontext
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.hardware_backend.npu import memory_pool_npu as pools
 from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp import interleave as cp
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,6 +21,25 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestNpuDsaC8(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        norm = ModuleType("sgl_kernel_npu.operators.norm")
+        norm.fused_split_qk_norm = Mock()
+        matmul = ModuleType("sgl_kernel_npu.operators.matmul")
+        matmul.batch_matmul_transpose = Mock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "torch_npu": ModuleType("torch_npu"),
+                norm.__name__: norm,
+                matmul.__name__: matmul,
+            },
+        ):
+            cls.attention = importlib.import_module(
+                "sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu"
+            )
+
     def setUp(self):
         super().setUp()
         parallel = patch.object(
@@ -40,6 +64,309 @@ class TestNpuDsaC8(CustomTestCase):
             indexer_layer_ids=(0,),
             kv_cache_dim=656,
         )
+
+    @staticmethod
+    def quantize(x, dst_type, **kwargs):
+        # CPU stand-in for independent per-row/per-128-element quantization.
+        blocks = x.float().reshape(-1, 128)
+        scales = blocks.abs().amax(-1).clamp_min(1e-6) / 127
+        values = (blocks / scales[:, None]).round().to(dst_type).reshape(x.shape)
+        return values, scales
+
+    @staticmethod
+    def scatter(cache, indices, values):
+        cache[indices.flatten().long()] = values
+
+    @contextmanager
+    def cp_gather(self, batch, rank, full_values):
+        """Run the real interleave reorder with a simulated CP16 all-gather."""
+        strategy = cp.InterleaveCPStrategy(cp_size=16)
+        batch.attn_cp_metadata = strategy.build_metadata(
+            num_tokens=full_values[0].shape[0], seqs_len=None
+        )
+        pending = iter(full_values)
+
+        def collective(output, local):
+            full = next(pending)
+            shards = [full[r::16] for r in range(16)]
+            rows = max(x.shape[0] for x in shards)
+            padded = [
+                torch.cat([x, x.new_zeros((rows - x.shape[0], *x.shape[1:]))])
+                for x in shards
+            ]
+            torch.testing.assert_close(local, padded[rank], rtol=0, atol=0)
+            output.copy_(torch.cat(padded))
+
+        with (
+            patch.object(
+                cp_base, "get_parallel", return_value=SimpleNamespace(attn_cp_rank=rank)
+            ),
+            patch.object(
+                cp, "get_parallel", return_value=SimpleNamespace(attn_cp_group=None)
+            ),
+            patch.object(cp, "use_symmetric_memory", return_value=nullcontext()),
+            patch.object(cp, "is_allocation_symmetric", return_value=False),
+            patch.object(cp, "attn_cp_all_gather_into_tensor", side_effect=collective),
+        ):
+            yield strategy.gather_hidden_states
+        self.assertIsNone(next(pending, None), "Expected collective was skipped")
+
+    def test_cp_main_kv_matches_full_quantization_without_rewriting_cache(self):
+        mod = self.attention
+        vendor = SimpleNamespace(
+            npu_dynamic_block_quant=Mock(side_effect=self.quantize),
+            npu_scatter_nd_update_=Mock(side_effect=self.scatter),
+        )
+        for tokens, rank, use_cp, dtype in (
+            (32, 0, True, torch.int8),
+            (35, 15, True, torch.int8),
+            (35, 2, True, torch.int8),
+            (35, 0, False, torch.int8),
+            (35, 15, True, torch.bfloat16),
+        ):
+            with (
+                self.subTest(tokens=tokens, rank=rank, cp=use_cp),
+                ExitStack() as stack,
+            ):
+                pool = self.make_pool(dtype)
+                stack.enter_context(
+                    patch.object(pools, "torch_npu", vendor, create=True)
+                )
+                full = torch.randn(tokens, 576, dtype=torch.bfloat16)
+                quantized_cp = use_cp and pool.dsa_kv_cache_store_c8
+                expected = (
+                    pool._pack_dsa_c8_kv_cache(full[:, :512], full[:, 512:])
+                    if pool.dsa_kv_cache_store_c8
+                    else None
+                )
+                vendor.npu_dynamic_block_quant.reset_mock()
+                vendor.npu_scatter_nd_update_.reset_mock()
+                local = full[rank::16] if use_cp else full
+                if use_cp and rank == 15:
+                    # Physical tail padding must not become a cached token.
+                    local = torch.cat([local, torch.full_like(local[:1], 123)])
+                positions = torch.arange(local.shape[0])
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    out_cache_loc=torch.arange(tokens) + 7,
+                )
+                rotary = Mock(side_effect=lambda positions, q, k: (q, k))
+                rotary.is_neox_style = True
+                rotary.cos_sin_cache = torch.zeros(tokens, 64)
+                model = SimpleNamespace(
+                    layer_id=0,
+                    q_lora_rank=2,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    qk_nope_head_dim=2,
+                    qk_head_dim=66,
+                    num_local_heads=1,
+                    v_head_dim=2,
+                    alt_stream=None,
+                    q_a_layernorm=lambda x: x,
+                    kv_a_layernorm=lambda x: x,
+                    fused_qkv_a_proj_with_mqa=lambda x: (
+                        torch.cat([x[:, :2], x], -1),
+                        None,
+                    ),
+                    q_b_proj=lambda x: (x.new_zeros((x.shape[0], 66)), None),
+                    rotary_emb=rotary,
+                    w_kc=None,
+                    w_vc=None,
+                    skip_topk=True,
+                    is_nextn=False,
+                    next_skip_topk=False,
+                    o_proj=lambda x: (x, None),
+                    rebuild_cp_kv_cache=Mock(
+                        return_value=(
+                            full[:, :512].unsqueeze(1),
+                            full[:, 512:].unsqueeze(1),
+                        )
+                    ),
+                )
+                for name, value in (
+                    ("get_token_to_kv_pool", lambda: pool),
+                    ("get_dsa_token_shard_plan", lambda batch: None),
+                    ("is_mla_preprocess_enabled", lambda: False),
+                    ("dsa_use_prefill_cp", lambda batch: use_cp),
+                    ("maybe_capture_indexer_topk", lambda layer, topk: topk),
+                    (
+                        "get_mla_dcp_backend",
+                        lambda backend: SimpleNamespace(
+                            uses_dcp_partial_attention=lambda batch: False
+                        ),
+                    ),
+                    ("batch_matmul_transpose", lambda x, w, **kwargs: x),
+                ):
+                    stack.enter_context(patch.object(mod, name, value))
+                stack.enter_context(
+                    patch.object(
+                        mod.forward_context, "get_attn_backend", return_value=None
+                    )
+                )
+                gather = (
+                    stack.enter_context(
+                        self.cp_gather(batch, rank, [expected.view(torch.uint8)])
+                    )
+                    if quantized_cp
+                    else Mock(side_effect=AssertionError("Non-CP gather"))
+                )
+                stack.enter_context(
+                    patch.object(mod, "cp_gather_full_sequence_states", gather)
+                )
+                state = mod.forward_dsa_prepare_npu(
+                    model, positions, local, batch, None, False
+                )
+                self.assertEqual(state[-1], quantized_cp)
+                if use_cp and not quantized_cp:
+                    model.rebuild_cp_kv_cache.assert_called_once()
+                else:
+                    model.rebuild_cp_kv_cache.assert_not_called()
+                with patch.object(
+                    mod,
+                    "forward_mla_attention_npu",
+                    return_value=local.new_zeros((local.shape[0], 1, 2)),
+                ) as attn:
+                    mod.forward_dsa_core_npu(model, *state)
+                self.assertEqual(
+                    attn.call_args.kwargs["save_kv_cache"], not quantized_cp
+                )
+                if quantized_cp:
+                    self.assertEqual(
+                        vendor.npu_dynamic_block_quant.call_args.args[0].shape[0],
+                        local.shape[0],
+                    )
+                    vendor.npu_dynamic_block_quant.assert_called_once()
+                    vendor.npu_scatter_nd_update_.assert_called_once()
+                    torch.testing.assert_close(
+                        pool.k_buffer[0].view(-1, 656)[batch.out_cache_loc],
+                        expected,
+                        rtol=0,
+                        atol=0,
+                    )
+                else:
+                    vendor.npu_dynamic_block_quant.assert_not_called()
+
+    def test_cp_indexer_gathers_quantized_k_and_matching_scales(self):
+        vendor = SimpleNamespace(
+            npu_dynamic_quant=Mock(side_effect=self.quantize),
+            npu_scatter_nd_update_=Mock(side_effect=self.scatter),
+        )
+        for tokens, rank, use_cp, dtype in (
+            (32, 0, True, torch.int8),
+            (35, 2, True, torch.int8),
+            (35, 15, True, torch.int8),
+            (35, 0, False, torch.int8),
+            (35, 15, True, torch.bfloat16),
+        ):
+            with self.subTest(tokens=tokens, rank=rank), ExitStack() as stack:
+                pool = self.make_pool(dtype)
+                for module in (pools, indexer):
+                    stack.enter_context(
+                        patch.object(module, "torch_npu", vendor, create=True)
+                    )
+                full = torch.randn(tokens, 128, dtype=torch.bfloat16)
+                quantized = pool.index_k_scale_buffer is not None
+                expected_k, expected_scale = (
+                    indexer._quantize_npu_indexer_activation(
+                        full, pool.indexer_hadamard_128, pool.dtype
+                    )
+                    if quantized
+                    else (full, None)
+                )
+                local = full[rank::16] if use_cp else full
+                if use_cp and rank == 15:
+                    local = torch.cat([local, torch.full_like(local[:1], 123)])
+                rows = local.shape[0]
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    out_cache_loc=torch.arange(tokens) + 7,
+                    attn_cp_metadata=None,
+                    seq_lens=torch.tensor([tokens]),
+                    extend_seq_lens=torch.tensor([tokens]),
+                )
+                full_values = (
+                    [expected_k.view(torch.uint8), expected_scale.view(-1, 1)]
+                    if quantized
+                    else [expected_k]
+                )
+                gather = (
+                    stack.enter_context(self.cp_gather(batch, rank, full_values))
+                    if use_cp
+                    else Mock(side_effect=AssertionError("Non-CP gather"))
+                )
+                rotary = Mock(side_effect=lambda positions, q, k: (q, k))
+                rotary.is_neox_style = False
+                rotary.cos_sin_cache = torch.zeros(tokens, 64)
+                model = SimpleNamespace(
+                    dsa_enable_prefill_cp=True,
+                    rotary_emb=rotary,
+                    n_heads=1,
+                    head_dim=128,
+                    rope_head_dim=64,
+                    hidden_size=128,
+                    wq_b=lambda x: (x, None),
+                    wk=lambda x: (x, None),
+                    k_norm=lambda x: x,
+                    num_init_tokens=0,
+                    num_local_tokens=0,
+                    weights_proj=Mock(return_value=(torch.ones(rows, 1), None)),
+                    index_topk=2,
+                    do_npu_cp_balance_indexer=Mock(
+                        return_value=torch.zeros(rows, 2, dtype=torch.int32)
+                    ),
+                )
+                model.weights_proj.weight = torch.ones(1, dtype=torch.bfloat16)
+                backend = SimpleNamespace(
+                    forward_metadata=SimpleNamespace(
+                        seq_lens_cpu_int=[tokens],
+                        actual_seq_lengths_q=torch.tensor([rows]),
+                        actual_seq_lengths_kv=torch.tensor([tokens]),
+                        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+                    )
+                )
+                for name, value in (
+                    ("get_token_to_kv_pool", lambda: pool),
+                    ("get_parallel", lambda: SimpleNamespace(dcp_enabled=False)),
+                    ("get_attn_backend", lambda: backend),
+                    ("cp_gather_full_sequence_states", gather),
+                    ("_get_indexer_query_shard", lambda batch, bs: None),
+                ):
+                    stack.enter_context(patch.object(indexer, name, value))
+                stack.enter_context(
+                    patch.object(
+                        indexer.envs.SGLANG_NPU_USE_MULTI_STREAM,
+                        "get",
+                        return_value=False,
+                    )
+                )
+                kernel = Mock(return_value=torch.zeros(rows, 1, 2, dtype=torch.int32))
+                stack.enter_context(
+                    patch.object(
+                        torch.ops,
+                        "npu",
+                        SimpleNamespace(npu_quant_lightning_indexer=kernel),
+                    )
+                )
+                indexer.DSANPUIndexerMixin.forward_npu(
+                    model, local, local, torch.arange(rows), batch, 0
+                )
+                torch.testing.assert_close(
+                    pool.get_index_k_buffer(0).view(-1, 128)[batch.out_cache_loc],
+                    expected_k,
+                    rtol=0,
+                    atol=0,
+                )
+                if quantized:
+                    torch.testing.assert_close(
+                        pool.get_index_k_scale_buffer(0).view(-1)[batch.out_cache_loc],
+                        expected_scale,
+                        rtol=0,
+                        atol=0,
+                    )
+                    self.assertEqual(kernel.call_args.kwargs["query"].shape[0], rows)
+                else:
+                    model.do_npu_cp_balance_indexer.assert_called_once()
 
     def test_fp8_and_int8_allocate_the_same_packed_main_cache(self):
         for dtype, scale_dtype in (

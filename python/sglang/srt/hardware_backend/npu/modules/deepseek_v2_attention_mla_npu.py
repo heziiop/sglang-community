@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard import (
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
@@ -401,6 +402,7 @@ def forward_dsa_prepare_npu(
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
+    kv_cache_written = mla_preprocess_used
     if mla_preprocess_used:
         (
             q_pe,
@@ -498,10 +500,21 @@ def forward_dsa_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
+            pool = get_token_to_kv_pool()
+            if pool.dsa_kv_cache_store_c8:
+                # Quantize local rows; gather opaque C8 records in token order.
+                packed = pool._pack_dsa_c8_kv_cache(k_nope, k_pe)
+                packed = cp_gather_full_sequence_states(
+                    packed.view(torch.uint8), forward_batch
+                )
+                pool.set_dsa_c8_kv_buffer(
+                    m.layer_id, forward_batch.out_cache_loc, packed
+                )
+                kv_cache_written = True
+            else:
+                k_nope, k_pe = m.rebuild_cp_kv_cache(
+                    latent_cache, forward_batch, k_nope, k_pe
+                )
 
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
@@ -542,7 +555,7 @@ def forward_dsa_prepare_npu(
         forward_batch,
         zero_allocator,
         positions,
-        mla_preprocess_used,
+        kv_cache_written,
     )
 
 
@@ -556,7 +569,7 @@ def forward_dsa_core_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
-    mla_preprocess_used: bool,
+    kv_cache_written: bool,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
@@ -575,7 +588,7 @@ def forward_dsa_core_npu(
             k_nope.contiguous(),
             q_pe.contiguous(),
             k_pe.contiguous(),
-            save_kv_cache=not mla_preprocess_used,
+            save_kv_cache=not kv_cache_written,
             topk_indices=topk_indices,
         )
     else:
@@ -632,7 +645,7 @@ def forward_dsa_core_npu(
             k_nope.contiguous(),
             k_nope.contiguous(),
             forward_batch,
-            save_kv_cache=not mla_preprocess_used,
+            save_kv_cache=not kv_cache_written,
             q_rope=q_pe.contiguous(),
             k_rope=k_pe.contiguous(),
             topk_indices=attn_topk_indices,

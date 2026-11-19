@@ -1122,6 +1122,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         return packed.view(self.dtype)
 
+    def set_dsa_c8_kv_buffer(self, layer_id: int, loc, packed: torch.Tensor):
+        """Store C8 records already quantized and packed, including CP gathers."""
+        self._raise_if_native_kv_cache_disabled()
+        torch_npu.npu_scatter_nd_update_(
+            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_cache_dim),
+            loc.view(-1, 1),
+            packed.view(self.dtype).view(-1, 1, self.kv_cache_dim),
+        )
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -1138,13 +1147,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
             packed = self._pack_dsa_c8_kv_cache(cache_k, cache_v)
-            torch_npu.npu_scatter_nd_update_(
-                self.k_buffer[layer_id - self.start_layer].view(
-                    -1, 1, self.kv_cache_dim
-                ),
-                loc.view(-1, 1),
-                packed.view(-1, 1, self.kv_cache_dim),
-            )
+            self.set_dsa_c8_kv_buffer(layer_id, loc, packed)
             return
 
         if cache_v is None:

@@ -444,17 +444,6 @@ class DSANPUIndexerMixin:
             q = torch.cat([q_pe, q_nope], dim=-1)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-        if (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            k = cp_gather_full_sequence_states(
-                k.contiguous().view(-1, self.head_dim),
-                forward_batch,
-                torch.npu.current_stream(),
-            )
-
         indexer_cache_loc = forward_batch.out_cache_loc
         parallel = get_parallel()
         if (
@@ -483,6 +472,19 @@ class DSANPUIndexerMixin:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
+        if is_prefill and uses_prefill_cp:
+            # Gather quantized K and its scales rather than BF16 projected K.
+            if use_quant_indexer:
+                k = k.view(torch.uint8)
+            k = cp_gather_full_sequence_states(
+                k.contiguous().view(-1, self.head_dim), forward_batch
+            )
+            if use_quant_indexer:
+                k = k.view(pool.dtype)
+                k_scale = cp_gather_full_sequence_states(
+                    k_scale.view(-1, 1), forward_batch
+                )
+        if use_quant_indexer:
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
