@@ -243,7 +243,9 @@ class SchedulerProfilerManager:
                     None
                     if not _is_npu
                     else torch_npu.profiler.tensorboard_trace_handler(
-                        str(self.torch_profiler_output_dir)
+                        str(self.torch_profiler_output_dir),
+                        # Save raw data here; analyse after the benchmark.
+                        analyse_flag=False,
                     )
                 ),
                 experimental_config=(
@@ -251,7 +253,7 @@ class SchedulerProfilerManager:
                     if not _is_npu
                     else torch_npu.profiler._ExperimentalConfig(
                         export_type=torch_npu.profiler.ExportType.Text,
-                        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
                         msprof_tx=False,
                         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
                         l2_cache=False,

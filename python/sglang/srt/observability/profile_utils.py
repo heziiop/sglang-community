@@ -344,7 +344,11 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             on_trace_ready=(
                 None
                 if not _is_npu
-                else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
+                else torch_npu.profiler.tensorboard_trace_handler(
+                    self.output_dir,
+                    # Save raw data here; analyse after the benchmark.
+                    analyse_flag=False,
+                )
             ),
         )
         self.torch_profiler.start()
