@@ -253,7 +253,7 @@ class SchedulerProfilerManager:
                     if not _is_npu
                     else torch_npu.profiler._ExperimentalConfig(
                         export_type=torch_npu.profiler.ExportType.Text,
-                        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
                         msprof_tx=False,
                         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
                         l2_cache=False,
