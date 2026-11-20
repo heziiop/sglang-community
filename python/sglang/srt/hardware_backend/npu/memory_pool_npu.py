@@ -1038,8 +1038,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
+    def _scatter_dsa_cache(self, cache, indices, updates):
+        if self.dtype == torch.int8:
+            # INT8 C8 uses INT8 main/index KV and FP16 index scales.
+            from sgl_kernel_npu.operators.data_move import scatter_nd_update_hp
+
+            scatter_nd_update_hp(cache, indices.contiguous(), updates.contiguous())
+        else:
+            torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_dsa_cache(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
             scale.view(-1, 1),
@@ -1125,7 +1134,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def set_dsa_c8_kv_buffer(self, layer_id: int, loc, packed: torch.Tensor):
         """Store C8 records already quantized and packed, including CP gathers."""
         self._raise_if_native_kv_cache_disabled()
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_dsa_cache(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_cache_dim),
             loc.view(-1, 1),
             packed.view(self.dtype).view(-1, 1, self.kv_cache_dim),
@@ -1244,7 +1253,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.store_dtype != self.dtype:
             index_k = index_k.view(self.store_dtype)
 
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_dsa_cache(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
                 -1, 1, self.index_head_dim
             ),

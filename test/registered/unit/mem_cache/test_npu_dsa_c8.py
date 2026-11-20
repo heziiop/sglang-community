@@ -49,6 +49,10 @@ class TestNpuDsaC8(CustomTestCase):
         )
         parallel.start()
         self.addCleanup(parallel.stop)
+        data_move = ModuleType("sgl_kernel_npu.operators.data_move")
+        self.hp_scatter = Mock(side_effect=self.scatter)
+        data_move.scatter_nd_update_hp = self.hp_scatter
+        self.enterContext(patch.dict("sys.modules", {data_move.__name__: data_move}))
 
     def make_pool(self, dtype):
         return pools.NPUMLATokenToKVPool(
@@ -141,6 +145,7 @@ class TestNpuDsaC8(CustomTestCase):
                 )
                 vendor.npu_dynamic_block_quant.reset_mock()
                 vendor.npu_scatter_nd_update_.reset_mock()
+                self.hp_scatter.reset_mock()
                 local = full[rank::16] if use_cp else full
                 if use_cp and rank == 15:
                     # Physical tail padding must not become a cached token.
@@ -237,7 +242,8 @@ class TestNpuDsaC8(CustomTestCase):
                         local.shape[0],
                     )
                     vendor.npu_dynamic_block_quant.assert_called_once()
-                    vendor.npu_scatter_nd_update_.assert_called_once()
+                    self.hp_scatter.assert_called_once()
+                    vendor.npu_scatter_nd_update_.assert_not_called()
                     torch.testing.assert_close(
                         pool.k_buffer[0].view(-1, 656)[batch.out_cache_loc],
                         expected,
@@ -260,6 +266,8 @@ class TestNpuDsaC8(CustomTestCase):
             (35, 15, True, torch.bfloat16),
         ):
             with self.subTest(tokens=tokens, rank=rank), ExitStack() as stack:
+                self.hp_scatter.reset_mock()
+                vendor.npu_scatter_nd_update_.reset_mock()
                 pool = self.make_pool(dtype)
                 for module in (pools, indexer):
                     stack.enter_context(
@@ -358,6 +366,8 @@ class TestNpuDsaC8(CustomTestCase):
                     atol=0,
                 )
                 if quantized:
+                    self.assertEqual(self.hp_scatter.call_count, 2)
+                    vendor.npu_scatter_nd_update_.assert_not_called()
                     torch.testing.assert_close(
                         pool.get_index_k_scale_buffer(0).view(-1)[batch.out_cache_loc],
                         expected_scale,
@@ -366,7 +376,39 @@ class TestNpuDsaC8(CustomTestCase):
                     )
                     self.assertEqual(kernel.call_args.kwargs["query"].shape[0], rows)
                 else:
+                    self.hp_scatter.assert_not_called()
+                    vendor.npu_scatter_nd_update_.assert_called_once()
                     model.do_npu_cp_balance_indexer.assert_called_once()
+
+    def test_hp_writes_accept_strided_inputs_and_preserve_other_rows(self):
+        pool = self.make_pool(torch.int8)
+        loc = torch.tensor([3, 99, 7, 99, 1, 99], dtype=torch.int32)[::2]
+        packed = torch.randint(-128, 128, (6, 656), dtype=torch.int8)[::2]
+        index_k = torch.randint(-128, 128, (6, 128), dtype=torch.int8)[::2]
+        scales = torch.randn(6, dtype=torch.float16)[::2]
+        self.assertFalse(loc.is_contiguous())
+        before = [
+            (buffer, buffer.clone(), updates)
+            for buffer, updates in (
+                (pool.k_buffer[0].view(-1, 656), packed),
+                (pool.get_index_k_buffer(0).view(-1, 128), index_k),
+                (pool.get_index_k_scale_buffer(0).view(-1, 1), scales[:, None]),
+            )
+        ]
+        pool.set_dsa_c8_kv_buffer(0, loc, packed)
+        pool.set_index_k_buffer(0, loc, index_k)
+        pool.set_index_k_scale_buffer(0, loc, scales)
+
+        self.assertEqual(self.hp_scatter.call_count, 3)
+        self.assertEqual(
+            [call.args[0].dtype for call in self.hp_scatter.call_args_list],
+            [torch.int8, torch.int8, torch.float16],
+        )
+        for call in self.hp_scatter.call_args_list:
+            self.assertTrue(all(t.is_contiguous() for t in call.args))
+        for buffer, expected, updates in before:
+            expected[loc.long()] = updates
+            torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
 
     def test_fp8_and_int8_allocate_the_same_packed_main_cache(self):
         for dtype, scale_dtype in (
