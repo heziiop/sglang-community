@@ -37,6 +37,7 @@ from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_memory,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1462,14 +1463,27 @@ def build_kv_layer_ids(
     into a reserved band above the target's layer range. Both PD peers run this
     against the same draft config and so agree on the band.
 
-    Returns [] for pools that cannot report ids, leaving the peers on positional
-    pairing: only a pool wrapping one token KV view (its other layers hold
-    state), or one whose main page rows pair by layer id, reports them.
+    Returns [] when the transfer layout uses positional pairing.
     """
     # The owner region reports the ids its entries pair by. A unified pool's
     # owner region is one whole-envelope entry with none, yet a pool wrapping
     # one token KV view still pairs its draft's entries by id.
     layer_ids = list(storage.regions(storage.owner).layer_ids)
+    if not layer_ids and is_npu():
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+
+        # NPU DSA publishes one group of entries per buffer type. A contiguous
+        # PP slice of the decode list only works for one entry per layer.
+        if (
+            isinstance(storage, StaticKVStorage)
+            and isinstance(token_to_kv_pool, NPUMLATokenToKVPool)
+            and token_to_kv_pool.index_head_dim is not None
+            and get_disagg().disaggregation_transfer_backend
+            == TransferBackend.MOONCAKE.value
+            and not get_memory().enable_hisparse
+        ):
+            layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if not layer_ids and token_to_kv_pool.layer_router.wrapped_view() is None:
         return []
     if draft_token_to_kv_pool is None:
