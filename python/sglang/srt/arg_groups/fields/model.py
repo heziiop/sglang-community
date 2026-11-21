@@ -219,6 +219,19 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Storage dtype for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). Defaults to the main KV cache dtype. "
+                '"bf16" or "bfloat16" keeps indexer keys unquantized; '
+                '"int8" stores them in INT8 with FP16 scales, independently '
+                "of the main KV cache dtype."
+            ),
+            choices=["bf16", "bfloat16", "int8"],
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(

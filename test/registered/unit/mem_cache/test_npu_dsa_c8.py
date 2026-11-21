@@ -54,7 +54,7 @@ class TestNpuDsaC8(CustomTestCase):
         data_move.scatter_nd_update_hp = self.hp_scatter
         self.enterContext(patch.dict("sys.modules", {data_move.__name__: data_move}))
 
-    def make_pool(self, dtype):
+    def make_pool(self, dtype, indexer_dtype=None):
         return pools.NPUMLATokenToKVPool(
             size=128,
             page_size=128,
@@ -66,7 +66,8 @@ class TestNpuDsaC8(CustomTestCase):
             enable_memory_saver=False,
             index_head_dim=128,
             indexer_layer_ids=(0,),
-            kv_cache_dim=656,
+            kv_cache_dim=656 if dtype != torch.bfloat16 else None,
+            indexer_dtype=indexer_dtype,
         )
 
     @staticmethod
@@ -258,26 +259,36 @@ class TestNpuDsaC8(CustomTestCase):
             npu_dynamic_quant=Mock(side_effect=self.quantize),
             npu_scatter_nd_update_=Mock(side_effect=self.scatter),
         )
-        for tokens, rank, use_cp, dtype in (
-            (32, 0, True, torch.int8),
-            (35, 2, True, torch.int8),
-            (35, 15, True, torch.int8),
-            (35, 0, False, torch.int8),
-            (35, 15, True, torch.bfloat16),
+        for tokens, rank, use_cp, dtype, indexer_dtype in (
+            (32, 0, True, torch.int8, None),
+            (35, 2, True, torch.int8, None),
+            (35, 15, True, torch.int8, None),
+            (35, 0, False, torch.int8, None),
+            (35, 15, True, torch.bfloat16, None),
+            (35, 2, True, torch.bfloat16, torch.int8),
+            (35, 2, True, torch.int8, torch.bfloat16),
         ):
-            with self.subTest(tokens=tokens, rank=rank), ExitStack() as stack:
+            with (
+                self.subTest(
+                    tokens=tokens, rank=rank, dtype=dtype, indexer_dtype=indexer_dtype
+                ),
+                ExitStack() as stack,
+            ):
                 self.hp_scatter.reset_mock()
                 vendor.npu_scatter_nd_update_.reset_mock()
-                pool = self.make_pool(dtype)
+                pool = self.make_pool(dtype, indexer_dtype)
+                self.assertEqual(pool.k_buffer.dtype, dtype)
                 for module in (pools, indexer):
                     stack.enter_context(
                         patch.object(module, "torch_npu", vendor, create=True)
                     )
                 full = torch.randn(tokens, 128, dtype=torch.bfloat16)
-                quantized = pool.index_k_scale_buffer is not None
+                expected_dtype = indexer_dtype or dtype
+                quantized = expected_dtype == torch.int8
+                self.assertEqual(pool.get_index_k_buffer(0).dtype, expected_dtype)
                 expected_k, expected_scale = (
                     indexer._quantize_npu_indexer_activation(
-                        full, pool.indexer_hadamard_128, pool.dtype
+                        full, pool.indexer_hadamard_128, expected_dtype
                     )
                     if quantized
                     else (full, None)
@@ -375,7 +386,12 @@ class TestNpuDsaC8(CustomTestCase):
                         atol=0,
                     )
                     self.assertEqual(kernel.call_args.kwargs["query"].shape[0], rows)
+                    self.assertEqual(kernel.call_args.kwargs["query"].dtype, torch.int8)
+                    self.assertEqual(
+                        kernel.call_args.kwargs["weights"].dtype, torch.float16
+                    )
                 else:
+                    self.assertIsNone(pool.index_k_scale_buffer)
                     self.hp_scatter.assert_not_called()
                     vendor.npu_scatter_nd_update_.assert_called_once()
                     model.do_npu_cp_balance_indexer.assert_called_once()

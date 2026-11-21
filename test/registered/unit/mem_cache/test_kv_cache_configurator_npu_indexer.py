@@ -6,6 +6,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,6 +21,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         configurator.modelslim_cache_layout = None
         configurator.device = "cpu"
         configurator.is_draft_worker = False
+        configurator.spec_algorithm = SpeculativeAlgorithm.NONE
         configurator.kv_cache_dtype = torch.bfloat16
         configurator.layer_info = SimpleNamespace(
             start_layer=10,
@@ -34,6 +37,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         pool = object()
 
         with (
+            get_context().override_server_args(indexer_kv_cache_dtype="int8"),
             patch.object(
                 kcc,
                 "get_parallel",
@@ -75,6 +79,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         self.assertEqual(pool_class.call_args.args, (64,))
         self.assertEqual(pool_class.call_args.kwargs["index_size"], 128)
         self.assertEqual(pool_class.call_args.kwargs["indexer_layer_ids"], (10, 12))
+        self.assertEqual(pool_class.call_args.kwargs["indexer_dtype"], torch.int8)
 
 
 if __name__ == "__main__":

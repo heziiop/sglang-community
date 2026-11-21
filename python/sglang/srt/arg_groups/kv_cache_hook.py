@@ -360,6 +360,46 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
 
+def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
+    """Check explicit DSA lightning-indexer cache dtypes on Ascend NPU."""
+    cfg = resolving_view(server_args)
+
+    if cfg.indexer_kv_cache_dtype is None:
+        return
+
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
+            "supported with --enable-hierarchical-cache. Disable hierarchical "
+            "cache or leave --indexer-kv-cache-dtype unset."
+        )
+
+    if not get_platform().is_npu:
+        raise RuntimeError(
+            "--indexer-kv-cache-dtype is only supported on Ascend NPU "
+            "(the lightning indexer uses CANN operators)."
+        )
+
+    from sglang.srt.configs.model_config import (
+        AttentionArch,
+        is_deepseek_dsa,
+        uses_compressed_kv_attention,
+    )
+
+    model_config = model_config_of(server_args)
+    if (
+        model_config.attention_arch != AttentionArch.MLA
+        or not is_deepseek_dsa(model_config.hf_config)
+        or uses_compressed_kv_attention(model_config.hf_config)
+        or mambaish_config(model_config) is not None
+    ):
+        raise ValueError("--indexer-kv-cache-dtype requires an Ascend DSA MLA KV pool.")
+    if cfg.attention_backend != "ascend":
+        raise ValueError(
+            "--indexer-kv-cache-dtype requires --attention-backend ascend."
+        )
+
+
 def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     """Validate --prefill-only-disable-kv-cache backend constraint.
 

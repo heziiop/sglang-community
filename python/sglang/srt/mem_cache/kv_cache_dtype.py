@@ -110,3 +110,21 @@ def configure_kv_cache_dtype(
         kv_cache_dtype_str = "auto"
 
     return kv_cache_dtype_str, kv_cache_dtype
+
+
+def resolve_indexer_kv_cache_dtype(
+    indexer_kv_cache_dtype: Optional[str],
+) -> Optional[torch.dtype]:
+    """None follows the main KV pool; an explicit dtype overrides only Indexer KV."""
+    if indexer_kv_cache_dtype is None:
+        return None
+    dtype = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "int8": torch.int8,
+    }.get(indexer_kv_cache_dtype)
+    if dtype is None:
+        raise ValueError(
+            f"Unsupported indexer_kv_cache_dtype: {indexer_kv_cache_dtype}."
+        )
+    return dtype

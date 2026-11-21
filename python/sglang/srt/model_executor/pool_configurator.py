@@ -697,7 +697,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            dtype = kvc.kv_cache_dtype
+            from sglang.srt.mem_cache.kv_cache_dtype import (
+                resolve_indexer_kv_cache_dtype,
+            )
+
+            dtype = (
+                resolve_indexer_kv_cache_dtype(get_model().indexer_kv_cache_dtype)
+                or kvc.kv_cache_dtype
+            )
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype == torch.int8:
                 # A3 LI C8 stores one FP16 scale per 128-dimensional key.

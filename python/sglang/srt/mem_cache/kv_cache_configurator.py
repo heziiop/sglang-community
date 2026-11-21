@@ -2323,6 +2323,7 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_kv_cache_dtype
 
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
@@ -2380,6 +2381,11 @@ class KVCacheConfigurator:
                 else None
             ),
             is_draft_worker=self.is_draft_worker,
+            indexer_dtype=(
+                resolve_indexer_kv_cache_dtype(get_model().indexer_kv_cache_dtype)
+                if is_dsa_model
+                else None
+            ),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

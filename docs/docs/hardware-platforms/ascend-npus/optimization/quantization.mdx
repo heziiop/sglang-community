@@ -493,7 +493,7 @@ python3 -m sglang.launch_server \
 
 ## DSA INT8 KV cache on Ascend A3
 
-For DeepSeek-V3.2-style DSA models, including GLM-5.2, select INT8 C8 cache with `--kv-cache-dtype int8`. This uses the existing NPU C8 path for both the main Attention KV cache and the Lightning Indexer cache. Model weight quantization is configured separately.
+For DeepSeek-V3.2-style DSA models, including GLM-5.2, select INT8 C8 cache with `--kv-cache-dtype int8`. The Lightning Indexer cache follows the main cache dtype by default. Use `--indexer-kv-cache-dtype int8` to quantize the indexer with a BF16 main cache, or `--indexer-kv-cache-dtype bf16` (also spelled `bfloat16`) to keep BF16 indexer keys with an INT8 main cache. Explicit indexer overrides require the Ascend backend and are incompatible with HiCache. Configure model weight quantization separately.
 
 With your Ascend environment installed, run a GLM-5.2 checkpoint with:
 

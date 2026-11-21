@@ -15,7 +15,7 @@ import torch
 
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor import pool_configurator
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,6 +110,42 @@ class TestNpuIndexKElision(CustomTestCase):
             )
         )
         self.assertEqual(cell_size, (INDEX_HEAD_DIM + 2) * len(INDEXER_LAYERS))
+
+    @patch.object(pool_configurator, "_is_npu", True)
+    def test_budget_matches_indexer_storage_with_dtype_override(self):
+        for main_dtype, indexer_arg, indexer_dtype in (
+            (torch.bfloat16, "int8", torch.int8),
+            (torch.int8, "bf16", torch.bfloat16),
+            (torch.float8_e4m3fn, "bfloat16", torch.bfloat16),
+            (torch.float8_e4m3fn, "int8", torch.int8),
+        ):
+            with (
+                self.subTest(main_dtype=main_dtype, indexer_arg=indexer_arg),
+                get_context().override_server_args(
+                    page_size=128, indexer_kv_cache_dtype=indexer_arg
+                ),
+                get_parallel().override(attn_dcp_rank=0),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                    return_value=main_dtype == torch.float8_e4m3fn,
+                ),
+            ):
+                kvc = _kvc()
+                kvc.kv_cache_dtype = main_dtype
+                pool = KVCacheConfigurator._build_ascend_mla_kv_pool(
+                    kvc, max_total_num_tokens=128, is_dsa_model=True
+                )
+                cell_size = pool_configurator.DefaultPoolConfigurator._compute_dsa_indexer_cell_size(
+                    None, kvc=kvc, num_layers=NUM_LAYERS
+                )
+                index_bytes = pool.index_k_buffer.nbytes
+                if pool.index_k_scale_buffer is not None:
+                    index_bytes += pool.index_k_scale_buffer.nbytes
+                self.assertEqual(
+                    cell_size, index_bytes // (pool.index_size + pool.page_size)
+                )
+                self.assertEqual(pool.k_buffer.dtype, main_dtype)
+                self.assertEqual(pool.get_index_k_buffer(0).dtype, indexer_dtype)
 
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
     def test_int8_dcp_rejected_before_allocating_incompatible_cache(self, _):

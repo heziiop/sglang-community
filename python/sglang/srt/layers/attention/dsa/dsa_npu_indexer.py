@@ -466,11 +466,11 @@ class DSANPUIndexerMixin:
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(
                 "NPU LSA does not support quantized indexer KV. "
-                "Use --kv-cache-dtype bfloat16; INT8 model weights remain supported."
+                "Use --indexer-kv-cache-dtype bfloat16."
             )
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k, pool.indexer_hadamard_128, pool.index_k_dtype
             )
         if is_prefill and uses_prefill_cp:
             # Gather quantized K and its scales rather than BF16 projected K.
@@ -480,7 +480,7 @@ class DSANPUIndexerMixin:
                 k.contiguous().view(-1, self.head_dim), forward_batch
             )
             if use_quant_indexer:
-                k = k.view(pool.dtype)
+                k = k.view(pool.index_k_dtype)
                 k_scale = cp_gather_full_sequence_states(
                     k_scale.view(-1, 1), forward_batch
                 )
@@ -584,9 +584,9 @@ class DSANPUIndexerMixin:
                 query, query_scale = _quantize_npu_indexer_activation(
                     query,
                     pool.indexer_hadamard_128,
-                    pool.dtype,
+                    pool.index_k_dtype,
                 )
-                if pool.dtype == torch.int8:
+                if pool.index_k_dtype == torch.int8:
                     weights = weights.to(torch.float16)
                 # custom_ops can replace the torch_npu alias with a different schema.
                 topk_indices = torch.ops.npu.npu_quant_lightning_indexer(

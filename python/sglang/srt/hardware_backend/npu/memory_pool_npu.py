@@ -714,6 +714,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        indexer_dtype: Optional[torch.dtype] = None,
         use_combined_kv_buffer: bool = False,
         modelslim_cache_layout=None,
     ):
@@ -781,6 +782,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             requested_kv_cache_dim if self.dsa_kv_cache_store_c8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_c8 else qk_rope_head_dim
+        self.index_k_dtype = dtype if indexer_dtype is None else indexer_dtype
+        self.index_k_store_dtype = (
+            self.store_dtype if indexer_dtype is None else indexer_dtype
+        )
+        self.index_k_scale_dtype = (
+            {torch.int8: torch.float16, torch.float8_e4m3fn: torch.float32}.get(
+                self.index_k_dtype
+            )
+            if self.dsa_kv_cache_store_c8 or indexer_dtype is not None
+            else None
+        )
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -859,17 +871,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_c8 and self.num_indexer_layers > 0:
+                if self.index_k_scale_dtype is not None and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
 
                     self.index_k_scale_buffer = torch.zeros(
                         (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float16 if dtype == torch.int8 else torch.float32,
+                        dtype=self.index_k_scale_dtype,
                         device=self.device,
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
@@ -1024,11 +1036,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
-        if self.store_dtype != self.dtype:
-            return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.dtype
-            )
-        return self.index_k_buffer[self._get_indexer_slot(layer_id)]
+        buffer = self.index_k_buffer[self._get_indexer_slot(layer_id)]
+        if self.index_k_store_dtype != self.index_k_dtype:
+            return buffer.view(self.index_k_dtype)
+        return buffer
 
     def _get_indexer_slot(self, layer_id: int) -> int:
         return self.indexer_layer_id_to_slot[layer_id]
@@ -1038,9 +1049,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
-    def _scatter_dsa_cache(self, cache, indices, updates):
-        if self.dtype == torch.int8:
-            # INT8 C8 uses INT8 main/index KV and FP16 index scales.
+    def _scatter_dsa_cache(self, cache, indices, updates, *, dtype):
+        if dtype == torch.int8:
+            # The INT8 cache path also uses this scatter for FP16 index scales.
             from sgl_kernel_npu.operators.data_move import scatter_nd_update_hp
 
             scatter_nd_update_hp(cache, indices.contiguous(), updates.contiguous())
@@ -1052,6 +1063,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
             scale.view(-1, 1),
+            dtype=self.index_k_dtype,
         )
 
     def _get_disagg_buffer_entries(self):
@@ -1139,6 +1151,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_cache_dim),
             loc.view(-1, 1),
             packed.view(self.dtype).view(-1, 1, self.kv_cache_dim),
+            dtype=self.dtype,
         )
 
     def set_kv_buffer(
@@ -1248,11 +1261,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        if self.index_k_scale_dtype is not None:
+            assert index_k.dtype == self.index_k_dtype, (
+                f"Expected quantized indexer keys of dtype {self.index_k_dtype}, "
+                f"got {index_k.dtype}."
+            )
+        elif index_k.dtype != self.index_k_dtype:
+            index_k = index_k.to(self.index_k_dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        if self.index_k_store_dtype != self.index_k_dtype:
+            index_k = index_k.view(self.index_k_store_dtype)
 
         self._scatter_dsa_cache(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
@@ -1260,6 +1278,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
+            dtype=self.index_k_dtype,
         )
 
     def _chunk_copy_npu_to_cpu(
