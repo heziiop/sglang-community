@@ -1480,7 +1480,7 @@ def build_kv_layer_ids(
             and isinstance(token_to_kv_pool, NPUMLATokenToKVPool)
             and token_to_kv_pool.index_head_dim is not None
             and get_disagg().disaggregation_transfer_backend
-            == TransferBackend.MOONCAKE.value
+            in (TransferBackend.MOONCAKE.value, TransferBackend.ASCEND.value)
             and not get_memory().enable_hisparse
         ):
             layer_ids = token_to_kv_pool.get_kv_layer_ids()

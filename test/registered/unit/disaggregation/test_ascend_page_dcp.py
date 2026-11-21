@@ -1,11 +1,17 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.utils import build_kv_layer_ids, setup_state_kv_args
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -13,6 +19,111 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAscendPageDcpSend(CustomTestCase):
+    def test_dsa_indexer_int8_pairs_all_buffers_across_pp(self):
+        """BF16 MLA with an INT8 indexer has four buffer groups, not three."""
+        publish(
+            ServerArgs(model_path="dummy", disaggregation_transfer_backend="ascend"),
+            role="tokenizer",
+        )
+        self.addCleanup(reset_context)
+        self.enterContext(
+            patch("sglang.srt.disaggregation.utils.is_npu", return_value=True)
+        )
+        parallel = get_parallel()
+        self.enterContext(
+            parallel.override(pp_group=SimpleNamespace(is_last_rank=True))
+        )
+
+        def register(start_layer, dcp_size):
+            with parallel.override(attn_dcp_size=dcp_size, attn_dcp_rank=0):
+                pool = NPUMLATokenToKVPool(
+                    size=16,
+                    page_size=2,
+                    dtype=torch.bfloat16,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    layer_num=2 - start_layer,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    index_head_dim=128,
+                    indexer_dtype=torch.int8,
+                    index_size=16 * dcp_size,
+                    start_layer=start_layer,
+                    end_layer=2,
+                )
+            storage = StaticKVStorage(
+                None, SimpleNamespace(get_kvcache=lambda: pool, state=None)
+            )
+            args = KVArgs()
+            args.kv_data_ptrs, _, args.kv_item_lens = pool.get_contiguous_buf_infos()
+            args.kv_layer_ids = build_kv_layer_ids(
+                token_to_kv_pool=pool,
+                draft_token_to_kv_pool=None,
+                num_draft_entries=0,
+                num_hidden_layers=2,
+                storage=storage,
+            )
+            args.page_size = pool.page_size
+            args.prefill_start_layer = start_layer
+            setup_state_kv_args(args, storage, total_kv_layers=2)
+            return pool, args
+
+        prefill_pool, src = register(start_layer=1, dcp_size=1)
+        mgr = object.__new__(AscendKVManager)
+        mgr.kv_args = src
+        mgr.pp_size = 2
+        mgr.is_mla_backend = True
+        mgr.is_hybrid_mla_backend = False
+        mgr.enable_custom_mem_pool = False
+        mgr.max_transfer_batch_indices = 0
+        mgr._dcp_remote_decode_layout = prefill_pool.get_dcp_remote_decode_layout()
+        mgr._transfer_data = Mock(return_value=0)
+        for dcp_size in (1, 2):
+            with self.subTest(dcp_size=dcp_size):
+                _decode_pool, dst = register(start_layer=0, dcp_size=dcp_size)
+                kwargs = dict(
+                    mooncake_session_id="decode",
+                    dst_kv_ptrs=dst.kv_data_ptrs,
+                    dst_kv_indices=np.array([2], dtype=np.int32),
+                    dst_layer_ids=dst.kv_layer_ids,
+                    executor=None,
+                )
+                if dcp_size == 1:
+                    rc = mgr.send_kvcache(
+                        **kwargs, prefill_kv_indices=np.array([1], dtype=np.int32)
+                    )
+                    pages = [(1, 2, 1)] * 4
+                else:
+                    rc = mgr.send_kvcache_dcp(
+                        **kwargs,
+                        prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                        dcp_token_item_lens=mgr.prepare_dcp_token_item_lens(
+                            dst.kv_item_lens, 2
+                        ),
+                        dst_dcp_size=2,
+                        dst_dcp_rank=1,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=4,
+                        dst_kv_item_lens=dst.kv_item_lens,
+                    )
+                    # Main K and RoPE take rank 1's page. Index K and scale
+                    # take both pages in the global slot space.
+                    pages = [(2, 2, 1)] * 2 + [(1, 4, 2)] * 2
+                self.assertEqual(rc, 0)
+                self.assertEqual(
+                    mgr._transfer_data.call_args.args[1],
+                    [
+                        (s + sp * width, d + dp * width, n * width)
+                        for s, d, width, (sp, dp, n) in zip(
+                            src.kv_data_ptrs,
+                            dst.kv_data_ptrs[1::2],
+                            src.kv_item_lens,
+                            pages,
+                        )
+                    ],
+                )
+
     def test_draft_global_slots_preserve_target_layout(self):
         for target_layout in (
             [False, False],
@@ -89,6 +200,7 @@ class TestAscendPageDcpSend(CustomTestCase):
         mgr.kv_args = SimpleNamespace(
             kv_buf_groups=3,
             kv_data_ptrs=[1_000, 2_000, 3_000],
+            kv_layer_ids=[],
             kv_item_lens=[20, 8, 4],
             page_size=2,
             mla_compression_ratios=None,

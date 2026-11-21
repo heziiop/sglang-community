@@ -305,10 +305,14 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
-        # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
-        # decode peer registers all model layers. Pair only this layout by
-        # global layer id; every other Ascend layout keeps the legacy path.
-        if self.is_hybrid_mla_backend and self.pp_size > 1:
+        # PP-local MLA entries must pair with a PP=1 decode peer by global
+        # layer id. NPU DSA publishes one id per buffer occurrence, so this
+        # also handles independent main/indexer KV dtypes.
+        if (
+            self.kv_args.kv_layer_ids
+            or dst_layer_ids
+            or (self.is_hybrid_mla_backend and self.pp_size > 1)
+        ):
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -465,7 +469,7 @@ class AscendKVManager(MooncakeKVManager):
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs
-        if self.is_hybrid_mla_backend:
+        if self.kv_args.kv_layer_ids or dst_layer_ids or self.is_hybrid_mla_backend:
             dst_indices = resolve_dcp_dst_entry_indices(
                 self.kv_args.kv_layer_ids,
                 dst_layer_ids,
