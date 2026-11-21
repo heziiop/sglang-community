@@ -3,6 +3,7 @@
 import importlib
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -688,6 +689,167 @@ class TestNpuDsaC8(CustomTestCase):
         self.assertEqual(vendor.npu_dynamic_quant.call_count, 2)
         for call in vendor.npu_dynamic_quant.call_args_list:
             torch.testing.assert_close(call.args[0], rotated)
+
+    def test_hicache_preserves_independent_main_and_indexer_dtypes(self):
+        """Mixed host mirrors must round-trip active layers without byte loss."""
+        from sglang.srt.mem_cache.pool_host import mla, npu_host_memory
+
+        def copy_components(direction, layout, **kwargs):
+            page_size = kwargs["page_size"]
+            for name in ("k", "v", "index_k", "index_k_scale"):
+                device = kwargs.get(f"device_{name}")
+                host = kwargs.get(f"host_{name}")
+                if device is None or host is None or not device.numel():
+                    continue
+                self.assertEqual(device.dtype, host.dtype)
+                if device.ndim == 4:
+                    device = device.unsqueeze(-1)
+                if layout == "page_first_kv_split":
+                    host = host.transpose(0, 1)
+                self.assertEqual(device.shape[0], host.shape[0])
+                for device_slot, host_slot in zip(
+                    kwargs["device_indices"].tolist(),
+                    kwargs["host_indices"].tolist(),
+                ):
+                    d = device[:, device_slot // page_size, device_slot % page_size]
+                    h = host[:, host_slot // page_size, host_slot % page_size]
+                    if direction == "backup":
+                        h.copy_(d)
+                    else:
+                        d.copy_(h)
+
+        for main_dtype in (torch.bfloat16, torch.int8):
+            for indexer_dtype in (torch.int8, torch.bfloat16):
+                for layout in ("page_first_kv_split", "layer_first_kv_split"):
+                    with self.subTest(
+                        main=main_dtype, indexer=indexer_dtype, layout=layout
+                    ):
+                        pool = pools.NPUMLATokenToKVPool(
+                            size=8,
+                            page_size=4,
+                            dtype=main_dtype,
+                            kv_lora_rank=512,
+                            qk_rope_head_dim=64,
+                            layer_num=3,
+                            device="cpu",
+                            enable_memory_saver=False,
+                            start_layer=40,
+                            end_layer=43,
+                            index_head_dim=128,
+                            indexer_layer_ids=(40, 42),
+                            indexer_dtype=indexer_dtype,
+                            kv_cache_dim=656 if main_dtype == torch.int8 else None,
+                        )
+                        reserved = Mock()
+                        with (
+                            patch(
+                                "sglang.srt.mem_cache.pool_host.base.available_host_memory_bytes",
+                                return_value=2**40,
+                            ),
+                            patch.object(
+                                npu_host_memory,
+                                "get_host_memory_backend",
+                                return_value=SimpleNamespace(ensure_capacity=reserved),
+                            ),
+                            patch.object(
+                                torch,
+                                "npu",
+                                SimpleNamespace(current_device=lambda: 0),
+                                create=True,
+                            ),
+                        ):
+                            host = mla.MLATokenToKVPoolHost(
+                                pool.get_device_pool_infos()[0].buffer_info,
+                                host_to_device_ratio=2,
+                                host_size=0,
+                                page_size=4,
+                                layout=layout,
+                                pin_memory=False,
+                                device_capacity_tokens=pool.size,
+                                start_layer=pool.start_layer,
+                                end_layer=pool.end_layer,
+                                target_layer_num=pool.layer_num,
+                                override_kv_cache_dim=pool.kv_cache_dim,
+                            )
+                        self.assertEqual(host.index_k_buffer.dtype, indexer_dtype)
+                        self.assertEqual(host.k_buffer.dtype, main_dtype)
+                        self.assertEqual(
+                            host.index_k_scale_buffer is not None,
+                            indexer_dtype == torch.int8,
+                        )
+                        if host.index_k_scale_buffer is not None:
+                            self.assertEqual(
+                                host.index_k_scale_buffer.dtype, torch.float16
+                            )
+                        host_buffers = (
+                            host.k_buffer,
+                            host.v_buffer,
+                            host.index_k_buffer,
+                            host.index_k_scale_buffer,
+                        )
+                        host_bytes = sum(
+                            b.nbytes for b in host_buffers if b is not None
+                        )
+                        self.assertEqual(host.size_per_token * host.size, host_bytes)
+                        self.assertEqual(sum(host.get_mapping_lengths()), host_bytes)
+                        reserved.assert_called_once_with(host_bytes, 0)
+                        host._init_npu_transfer_bindings()
+                        buffers = [pool.k_buffer, pool.v_buffer, pool.index_k_buffer]
+                        if pool.index_k_scale_buffer is not None:
+                            buffers.append(pool.index_k_scale_buffer)
+                        for buffer in buffers:
+                            buffer.copy_(
+                                (
+                                    torch.arange(buffer.numel()).reshape(buffer.shape)
+                                    % 113
+                                ).to(buffer.dtype)
+                            )
+                            if buffer.numel() and buffer.dtype in (
+                                torch.bfloat16,
+                                torch.float16,
+                            ):
+                                buffer.view(torch.int16).flatten()[:2] = torch.tensor(
+                                    [-32768, 0x7FC1], dtype=torch.int16
+                                )
+                        before = [buffer.clone() for buffer in buffers]
+                        device_indices = torch.arange(0, 4)
+                        host_indices = torch.arange(8, 12)
+                        suffix = "_lf_pf" if layout == "page_first_kv_split" else ""
+                        with patch.object(
+                            mla,
+                            "transfer_kv_all_layer_kv_split" + suffix,
+                            side_effect=partial(copy_components, "backup", layout),
+                            create=True,
+                        ):
+                            host.backup_from_device_all_layer(
+                                None, host_indices, device_indices, "kernel_ascend"
+                            )
+                        for buffer in buffers:
+                            buffer.zero_()
+                        suffix = "_pf_lf" if layout == "page_first_kv_split" else ""
+                        with patch.object(
+                            mla,
+                            "transfer_kv_per_layer_kv_split" + suffix,
+                            side_effect=partial(copy_components, "load", layout),
+                            create=True,
+                        ):
+                            for layer in range(pool.layer_num):
+                                host.load_to_device_per_layer(
+                                    None,
+                                    host_indices,
+                                    device_indices,
+                                    layer,
+                                    "kernel_ascend",
+                                )
+                        for buffer, original in zip(buffers, before):
+                            expected = torch.zeros_like(original)
+                            expected[:, 0] = original[:, 0]
+                            torch.testing.assert_close(
+                                buffer.view(torch.uint8),
+                                expected.view(torch.uint8),
+                                rtol=0,
+                                atol=0,
+                            )
 
     def test_int8_dtype_resolution_preserves_independent_draft_dtype(self):
         for is_draft, expected in (

@@ -433,6 +433,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     h.layout = layout
                     h.dsa_kv_cache_store_fp8 = packed
                     h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
+                    self.native.index_k.dtype = h.dtype
                     self.native.index_scales.dtype = SimpleNamespace(
                         itemsize=scale_bytes
                     )
@@ -495,6 +496,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     h.layout = layout
                     h.dsa_kv_cache_store_fp8 = packed
                     h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
+                    self.native.index_k.dtype = h.dtype
                     self.native.index_scales.dtype = SimpleNamespace(
                         itemsize=scale_bytes
                     )

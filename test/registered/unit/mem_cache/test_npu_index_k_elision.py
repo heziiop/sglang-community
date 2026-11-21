@@ -147,6 +147,38 @@ class TestNpuIndexKElision(CustomTestCase):
                 self.assertEqual(pool.k_buffer.dtype, main_dtype)
                 self.assertEqual(pool.get_index_k_buffer(0).dtype, indexer_dtype)
 
+    def test_hicache_accepts_explicit_indexer_dtypes(self):
+        """HiCache must permit an indexer dtype independent of the main KV."""
+        from transformers import PretrainedConfig
+
+        from sglang.srt.arg_groups import kv_cache_hook
+        from sglang.srt.configs.model_config import AttentionArch
+        from sglang.srt.server_args import ServerArgs
+
+        model_config = _kvc().model_config
+        model_config.hf_config = PretrainedConfig(**vars(model_config.hf_config))
+        model_config.attention_arch = AttentionArch.MLA
+        model_config.linear_attn_registry_result = None
+        with (
+            patch.object(kv_cache_hook, "model_config_of", return_value=model_config),
+            patch.object(
+                kv_cache_hook,
+                "get_platform",
+                return_value=types.SimpleNamespace(is_npu=True),
+            ),
+        ):
+            for main in ("bf16", "int8"):
+                for indexer in ("bf16", "int8"):
+                    with self.subTest(main=main, indexer=indexer):
+                        args = ServerArgs(
+                            model_path="dummy",
+                            attention_backend="ascend",
+                            kv_cache_dtype=main,
+                            indexer_kv_cache_dtype=indexer,
+                            enable_hierarchical_cache=True,
+                        )
+                        kv_cache_hook.handle_indexer_kv_cache_compatibility(args)
+
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
     def test_int8_dcp_rejected_before_allocating_incompatible_cache(self, _):
         kvc = _kvc()

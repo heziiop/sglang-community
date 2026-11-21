@@ -207,13 +207,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self._native_infos = infos
                 native = self._native_buffers
                 index_layers = len(native.index_layer_indices)
-                if (
-                    layout in ("page_first_kv_split", "layer_first_kv_split")
-                    and native.index_k is not None
-                ):
-                    self._size_per_token += (
-                        native.index_width * self.dtype.itemsize * index_layers
+                if layout in ("page_first_kv_split", "layer_first_kv_split"):
+                    self._size_per_token = (
+                        (native.k_width + native.v_width)
+                        * self.dtype.itemsize
+                        * self.layer_num
                     )
+                    if native.index_k is not None:
+                        self._size_per_token += (
+                            native.index_width
+                            * native.index_k.dtype.itemsize
+                            * index_layers
+                        )
                     if native.index_scales is not None:
                         self._size_per_token += (
                             native.index_scales.dtype.itemsize * index_layers
@@ -342,12 +347,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         per_row_widths = [
             self.layer_num * k_width * self.dtype.itemsize,
-            self.layer_num * self.qk_rope_head_dim * self.dtype.itemsize,
+            self.layer_num * native.v_width * self.dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
         if native.index_k is not None:
             per_row_widths.append(
-                index_layers * native.index_width * self.dtype.itemsize
+                index_layers * native.index_width * native.index_k.dtype.itemsize
             )
         if native.index_scales is not None:
             per_row_widths.append(index_layers * native.index_scales.dtype.itemsize)
@@ -495,7 +500,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if native.index_k is not None:
             self.index_k_buffer = alloc_func(
                 (*indexer_dims, native.index_width),
-                dtype=self.dtype,
+                dtype=native.index_k.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
