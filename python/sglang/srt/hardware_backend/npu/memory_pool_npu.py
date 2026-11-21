@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
@@ -739,6 +740,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self._use_scatter_hp = not is_npu_arch35()
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
@@ -1049,21 +1051,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
-    def _scatter_dsa_cache(self, cache, indices, updates, *, dtype):
-        if dtype == torch.int8:
-            # The INT8 cache path also uses this scatter for FP16 index scales.
-            from sgl_kernel_npu.operators.data_move import scatter_nd_update_hp
-
-            scatter_nd_update_hp(cache, indices.contiguous(), updates.contiguous())
-        else:
+    def _scatter_cache(self, cache, indices, updates):
+        if not self._use_scatter_hp:
             torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+            return
+
+        try:
+            from sgl_kernel_npu.operators.data_move import scatter_nd_update_hp
+        except ImportError:
+            torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+            return
+
+        scatter_nd_update_hp(cache, indices, updates)
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        self._scatter_dsa_cache(
+        self._scatter_cache(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
             scale.view(-1, 1),
-            dtype=self.index_k_dtype,
         )
 
     def _get_disagg_buffer_entries(self):
@@ -1147,11 +1152,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def set_dsa_c8_kv_buffer(self, layer_id: int, loc, packed: torch.Tensor):
         """Store C8 records already quantized and packed, including CP gathers."""
         self._raise_if_native_kv_cache_disabled()
-        self._scatter_dsa_cache(
+        self._scatter_cache(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_cache_dim),
             loc.view(-1, 1),
             packed.view(self.dtype).view(-1, 1, self.kv_cache_dim),
-            dtype=self.dtype,
         )
 
     def set_kv_buffer(
@@ -1190,7 +1194,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.use_combined_kv_buffer:
-            torch_npu.npu_scatter_nd_update_(
+            self._scatter_cache(
                 self.get_combined_kv_buffer(layer_id).view(
                     -1, 1, self.kv_cache_dim + self.kr_cache_dim
                 ),
@@ -1205,12 +1209,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_cache(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_cache(
             self.v_buffer[layer_id - self.start_layer].view(
                 -1, 1, self.qk_rope_head_dim
             ),
@@ -1272,13 +1276,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.index_k_store_dtype != self.index_k_dtype:
             index_k = index_k.view(self.index_k_store_dtype)
 
-        self._scatter_dsa_cache(
+        self._scatter_cache(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
                 -1, 1, self.index_head_dim
             ),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
-            dtype=self.index_k_dtype,
         )
 
     def _chunk_copy_npu_to_cpu(

@@ -49,6 +49,7 @@ class TestNpuDsaC8(CustomTestCase):
         )
         parallel.start()
         self.addCleanup(parallel.stop)
+        self.enterContext(patch.object(pools, "is_npu_arch35", return_value=False))
         data_move = ModuleType("sgl_kernel_npu.operators.data_move")
         self.hp_scatter = Mock(side_effect=self.scatter)
         data_move.scatter_nd_update_hp = self.hp_scatter
@@ -80,7 +81,9 @@ class TestNpuDsaC8(CustomTestCase):
 
     @staticmethod
     def scatter(cache, indices, values):
-        cache[indices.flatten().long()] = values
+        rows = indices.flatten().long()
+        valid = rows >= 0
+        cache[rows[valid]] = values[valid]
 
     @contextmanager
     def cp_gather(self, batch, rank, full_values):
@@ -392,8 +395,8 @@ class TestNpuDsaC8(CustomTestCase):
                     )
                 else:
                     self.assertIsNone(pool.index_k_scale_buffer)
-                    self.hp_scatter.assert_not_called()
-                    vendor.npu_scatter_nd_update_.assert_called_once()
+                    self.hp_scatter.assert_called_once()
+                    vendor.npu_scatter_nd_update_.assert_not_called()
                     model.do_npu_cp_balance_indexer.assert_called_once()
 
     def test_hp_writes_accept_strided_inputs_and_preserve_other_rows(self):
@@ -420,11 +423,174 @@ class TestNpuDsaC8(CustomTestCase):
             [call.args[0].dtype for call in self.hp_scatter.call_args_list],
             [torch.int8, torch.int8, torch.float16],
         )
+        # The updated adapter prepares strided inputs itself.
         for call in self.hp_scatter.call_args_list:
-            self.assertTrue(all(t.is_contiguous() for t in call.args))
+            self.assertFalse(call.args[1].is_contiguous())
+            self.assertFalse(call.args[2].is_contiguous())
         for buffer, expected, updates in before:
             expected[loc.long()] = updates
             torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
+
+    def test_hp_bf16_writes_preserve_the_original_bytes(self):
+        pool = self.make_pool(torch.bfloat16, torch.bfloat16)
+        loc = torch.tensor([3, 99, 7], dtype=torch.int32)
+        key = torch.randn(3, 128, dtype=torch.bfloat16)
+        main_k = torch.randn(3, 512, dtype=torch.bfloat16)
+        main_v = torch.randn(3, 64, dtype=torch.bfloat16)
+        key.view(torch.int16)[0, :2] = torch.tensor([-32768, 0x7FC1], dtype=torch.int16)
+        expected_key = pool.get_index_k_buffer(0).clone()
+        expected_main_k = pool.k_buffer[0].clone()
+        expected_main_v = pool.v_buffer[0].clone()
+        expected_key.view(-1, 128)[loc.long()] = key
+        expected_main_k.view(-1, 512)[loc.long()] = main_k
+        expected_main_v.view(-1, 64)[loc.long()] = main_v
+
+        pool.set_index_k_buffer(0, loc, key)
+        pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, main_k, main_v)
+
+        self.assertEqual(self.hp_scatter.call_count, 3)
+        self.assertTrue(
+            all(
+                call.args[0].dtype == call.args[2].dtype == torch.bfloat16
+                for call in self.hp_scatter.call_args_list
+            )
+        )
+        self.assertEqual(
+            [call.args[0].shape[-1] for call in self.hp_scatter.call_args_list],
+            [128, 512, 64],
+        )
+        torch.testing.assert_close(
+            pool.get_index_k_buffer(0).view(torch.int16), expected_key.view(torch.int16)
+        )
+        torch.testing.assert_close(pool.k_buffer[0], expected_main_k, rtol=0, atol=0)
+        torch.testing.assert_close(pool.v_buffer[0], expected_main_v, rtol=0, atol=0)
+
+    def test_a5_keeps_the_original_scatter_path(self):
+        vendor = SimpleNamespace(npu_scatter_nd_update_=Mock(side_effect=self.scatter))
+        with (
+            patch.object(pools, "torch_npu", vendor, create=True),
+            patch.object(pools, "is_npu_arch35", return_value=True),
+        ):
+            pool = self.make_pool(torch.bfloat16)
+            pool.set_index_k_buffer(
+                0,
+                torch.tensor([3], dtype=torch.int32),
+                torch.zeros(1, 128, dtype=torch.bfloat16),
+            )
+        self.hp_scatter.assert_not_called()
+        vendor.npu_scatter_nd_update_.assert_called_once()
+
+    def test_padded_writes_use_hp_including_during_graph_capture(self):
+        pool = self.make_pool(torch.int8)
+        vendor = SimpleNamespace(npu_scatter_nd_update_=Mock(side_effect=self.scatter))
+        loc = torch.tensor([3, 0, 0], dtype=torch.int32)
+        packed = torch.ones(3, 656, dtype=torch.int8)
+        with patch.object(pools, "torch_npu", vendor, create=True):
+            pool.set_dsa_c8_kv_buffer(0, loc, packed)
+            with patch(
+                "sglang.srt.model_executor.runner_utils.capture_mode.is_capture_mode",
+                True,
+            ):
+                pool.set_index_k_buffer(0, loc, packed[:, :128])
+
+        self.assertEqual(self.hp_scatter.call_count, 2)
+        _, hp_indices, hp_updates = self.hp_scatter.call_args_list[0].args
+        torch.testing.assert_close(hp_indices.view(-1), loc)
+        torch.testing.assert_close(hp_updates.view(-1, 656), packed)
+        vendor.npu_scatter_nd_update_.assert_not_called()
+        torch.testing.assert_close(pool.k_buffer[0].view(-1, 656)[3], packed[0])
+        torch.testing.assert_close(
+            pool.get_index_k_buffer(0).view(-1, 128)[3], packed[0, :128]
+        )
+
+    def test_mla_without_indexer_writes_all_layouts_on_each_architecture(self):
+        loc = torch.tensor([1, 17, 31], dtype=torch.int32)
+        for arch in (2201, 3510):
+            for dtype in (torch.bfloat16, torch.float16):
+                for layout in ("separate", "combined", "fia_nz"):
+                    with (
+                        self.subTest(arch=arch, dtype=dtype, layout=layout),
+                        patch.object(pools, "is_npu_arch35", return_value=arch == 3510),
+                    ):
+                        self.hp_scatter.reset_mock()
+                        vendor = SimpleNamespace(
+                            npu_scatter_nd_update_=Mock(side_effect=self.scatter)
+                        )
+                        pool = pools.NPUMLATokenToKVPool(
+                            size=32,
+                            page_size=16,
+                            dtype=dtype,
+                            kv_lora_rank=32,
+                            qk_rope_head_dim=16,
+                            layer_num=1,
+                            device="cpu",
+                            enable_memory_saver=False,
+                            use_combined_kv_buffer=layout == "combined",
+                        )
+                        pool.use_fia_nz = layout == "fia_nz"
+                        self.assertIsNone(pool.index_head_dim)
+                        latent = torch.arange(96).reshape(3, 1, 32).to(dtype)
+                        rope = torch.arange(48).reshape(3, 1, 16).to(dtype)
+                        if layout == "combined":
+                            buffers = [
+                                (pool.kv_buffer[0], torch.cat((latent, rope), -1))
+                            ]
+                        else:
+                            buffers = [
+                                (pool.k_buffer[0], latent),
+                                (pool.v_buffer[0], rope),
+                            ]
+                        expected_buffers = []
+                        for buffer, values in buffers:
+                            expected = torch.zeros_like(buffer)
+                            width = values.shape[-1]
+                            if layout == "fia_nz":
+                                tile_size = 32 // buffer.element_size()
+                                nz = expected.view(
+                                    -1, width // tile_size, 16, tile_size
+                                )
+                                for token, slot in enumerate(loc.tolist()):
+                                    nz[slot // 16, :, slot % 16, :] = values[
+                                        token
+                                    ].view(-1, tile_size)
+                            else:
+                                expected.view(-1, width)[loc.long()] = values.view(
+                                    -1, width
+                                )
+                            expected_buffers.append((buffer, expected))
+                        with patch.object(pools, "torch_npu", vendor, create=True):
+                            pool.set_kv_buffer(
+                                SimpleNamespace(layer_id=0), loc, latent, rope
+                            )
+                        for buffer, expected in expected_buffers:
+                            torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
+                        writes = 1 if layout == "combined" else 2
+                        use_hp = arch == 2201 and layout != "fia_nz"
+                        self.assertEqual(
+                            self.hp_scatter.call_count, writes if use_hp else 0
+                        )
+                        self.assertEqual(
+                            vendor.npu_scatter_nd_update_.call_count,
+                            0 if use_hp else writes,
+                        )
+
+    def test_dcp_main_kv_uses_hp_and_skips_negative_slots(self):
+        pool = self.make_pool(torch.bfloat16, torch.int8)
+        pool.dcp_size = 2
+        vendor = SimpleNamespace(npu_scatter_nd_update_=Mock(side_effect=self.scatter))
+        loc = torch.tensor([7, -1], dtype=torch.int32)
+        latent = torch.ones(2, 512, dtype=torch.bfloat16)
+        rope = torch.ones(2, 64, dtype=torch.bfloat16)
+        with patch.object(pools, "torch_npu", vendor, create=True):
+            pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, latent, rope)
+
+        self.assertEqual(self.hp_scatter.call_count, 2)
+        vendor.npu_scatter_nd_update_.assert_not_called()
+        for cache, updates in ((pool.k_buffer[0], latent), (pool.v_buffer[0], rope)):
+            rows = cache.view(-1, updates.shape[-1])
+            expected = torch.zeros_like(rows)
+            expected[7] = updates[0]
+            torch.testing.assert_close(rows, expected)
 
     def test_fp8_and_int8_allocate_the_same_packed_main_cache(self):
         for dtype, scale_dtype in (
